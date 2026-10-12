@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1650" viewBox="0 0 2200 1650">
+  <defs>
+    <marker id="a" markerWidth="11" markerHeight="11" refX="10" refY="3.5" orient="auto"><path d="M0,0 L11,3.5 L0,7 Z" fill="#263238"/></marker>
+    <marker id="da" markerWidth="11" markerHeight="11" refX="10" refY="3.5" orient="auto"><path d="M0,0 L11,3.5 L0,7 Z" fill="#607d8b"/></marker>
+    <style>
+      .title{font:700 31px Arial,sans-serif;fill:#17202a}.h{font:700 21px Arial,sans-serif;fill:#17202a}.b{font:16px Arial,sans-serif;fill:#263238}.s{font:14px Arial,sans-serif;fill:#455a64}.t{font:12px Arial,sans-serif;fill:#455a64}.box{stroke:#263238;stroke-width:2;rx:14}.purple{fill:#e8ddff}.blue{fill:#dcecff}.green{fill:#e5f3df}.orange{fill:#fff0cf}.gray{fill:#f4f6f7}.red{fill:#ffe1df}.dash{fill:none;stroke:#607d8b;stroke-width:2;stroke-dasharray:8 6;rx:18}.arrow{fill:none;stroke:#263238;stroke-width:2.5;marker-end:url(#a)}.darrow{fill:none;stroke:#607d8b;stroke-width:2;stroke-dasharray:8 6;marker-end:url(#da)}
+    </style>
+  </defs>
+  <rect width="2200" height="1650" fill="white"/>
+  <text x="1100" y="46" text-anchor="middle" class="title">PI0.5 Model Architecture — TianYi Adaptation</text>
+  <text x="1100" y="72" text-anchor="middle" class="s">Implementation view from openpi/models_pytorch/pi0_pytorch.py and pi0_config.py</text>
+
+  <rect x="35" y="105" width="345" height="590" class="box gray"/>
+  <text x="207" y="143" text-anchor="middle" class="h">Observation contract</text>
+  <rect x="65" y="175" width="285" height="105" class="box blue"/>
+  <text x="207" y="207" text-anchor="middle" class="h">Head RGB image</text>
+  <text x="207" y="237" text-anchor="middle" class="b">camera_head → base_0_rgb</text>
+  <text x="207" y="262" text-anchor="middle" class="s">resize / pad to 224×224</text>
+  <rect x="65" y="305" width="285" height="130" class="box green"/>
+  <text x="207" y="338" text-anchor="middle" class="h">TianYi state</text>
+  <text x="207" y="368" text-anchor="middle" class="b">stationary: L_arm7 | R_arm7 | L_grip | R_grip = 16D</text>
+  <text x="207" y="393" text-anchor="middle" class="b">mobile: + chassis_twist6 + head_position3 = 25D</text>
+  <text x="207" y="418" text-anchor="middle" class="s">PadStatesAndActions later pads state/action to width 32</text>
+  <rect x="65" y="460" width="285" height="100" class="box purple"/>
+  <text x="207" y="493" text-anchor="middle" class="h">Prompt</text>
+  <text x="207" y="524" text-anchor="middle" class="b">task text → PaliGemma tokenizer</text>
+  <text x="207" y="548" text-anchor="middle" class="s">max_token_len = 200 (PI0.5)</text>
+  <rect x="65" y="585" width="285" height="80" class="box orange"/>
+  <text x="207" y="618" text-anchor="middle" class="h">Noisy action xₜ</text>
+  <text x="207" y="646" text-anchor="middle" class="b">[B, 10, 32]</text>
+
+  <path d="M380 225 H485" class="arrow"/><path d="M380 365 H485" class="arrow"/><path d="M380 510 H485" class="arrow"/><path d="M380 625 H485" class="arrow"/>
+
+  <rect x="485" y="105" width="675" height="590" class="dash"/>
+  <text x="822" y="143" text-anchor="middle" class="h">PaliGemma prefix stream</text>
+  <rect x="525" y="182" width="255" height="150" class="box purple"/>
+  <text x="652" y="218" text-anchor="middle" class="h">SigLIP vision tower</text>
+  <text x="652" y="250" text-anchor="middle" class="b">image embeddings</text>
+  <text x="652" y="281" text-anchor="middle" class="s">three model slots exist</text>
+  <text x="652" y="305" text-anchor="middle" class="s">wrist slots masked for TianYi</text>
+  <rect x="825" y="182" width="285" height="150" class="box purple"/>
+  <text x="967" y="218" text-anchor="middle" class="h">Gemma language model</text>
+  <text x="967" y="250" text-anchor="middle" class="b">prompt + discrete state tokens</text>
+  <text x="967" y="281" text-anchor="middle" class="s">state is tokenized in PI0.5</text>
+  <text x="967" y="305" text-anchor="middle" class="s">not a continuous suffix state token</text>
+  <path d="M780 257 H825" class="arrow"/>
+  <rect x="555" y="385" width="530" height="118" class="box blue"/>
+  <text x="820" y="420" text-anchor="middle" class="h">Prefix tokens</text>
+  <text x="820" y="452" text-anchor="middle" class="b">image embeddings ∥ language/state embeddings</text>
+  <text x="820" y="480" text-anchor="middle" class="s">full attention inside prefix; cached at inference</text>
+  <path d="M650 332 V385" class="arrow"/><path d="M965 332 V385" class="arrow"/>
+  <rect x="555" y="545" width="530" height="105" class="box gray"/>
+  <text x="820" y="580" text-anchor="middle" class="h">Causal / prefix-LM attention</text>
+  <text x="820" y="612" text-anchor="middle" class="s">pad mask + attention mask → 4-D mask</text>
+  <path d="M820 503 V545" class="arrow"/>
+
+  <rect x="1245" y="105" width="620" height="590" class="dash"/>
+  <text x="1555" y="143" text-anchor="middle" class="h">Gemma 300M action expert suffix</text>
+  <rect x="1285" y="182" width="250" height="135" class="box orange"/>
+  <text x="1410" y="218" text-anchor="middle" class="h">action_in_proj</text>
+  <text x="1410" y="250" text-anchor="middle" class="b">32D xₜ → expert width</text>
+  <text x="1410" y="282" text-anchor="middle" class="s">linear projection</text>
+  <rect x="1570" y="182" width="255" height="135" class="box orange"/>
+  <text x="1697" y="218" text-anchor="middle" class="h">Time embedding</text>
+  <text x="1697" y="250" text-anchor="middle" class="b">sin/cos(t) → MLP</text>
+  <text x="1697" y="282" text-anchor="middle" class="s">adaRMSNorm condition</text>
+  <path d="M1535 250 H1570" class="arrow"/>
+  <rect x="1320" y="375" width="470" height="140" class="box orange"/>
+  <text x="1555" y="412" text-anchor="middle" class="h">Gemma 300M action expert</text>
+  <text x="1555" y="445" text-anchor="middle" class="b">suffix action tokens attend to prefix KV</text>
+  <text x="1555" y="477" text-anchor="middle" class="b">PI0.5: use_adarms = [False, True]</text>
+  <text x="1555" y="500" text-anchor="middle" class="s">gradient checkpointing available in PyTorch</text>
+  <path d="M1410 317 V375" class="arrow"/><path d="M1697 317 V375" class="arrow"/><path d="M1085 597 H1320" class="arrow"/>
+  <rect x="1320" y="560" width="470" height="88" class="box orange"/>
+  <text x="1555" y="596" text-anchor="middle" class="h">action_out_proj</text>
+  <text x="1555" y="625" text-anchor="middle" class="b">expert width → vector field vₜ ∈ R³²</text>
+  <path d="M1555 515 V560" class="arrow"/>
+
+  <rect x="35" y="775" width="830" height="740" class="dash"/>
+  <text x="450" y="814" text-anchor="middle" class="h">Flow matching objective (training)</text>
+  <rect x="85" y="860" width="300" height="110" class="box green"/>
+  <text x="235" y="898" text-anchor="middle" class="h">GT action a</text>
+  <text x="235" y="930" text-anchor="middle" class="b">[B, 10, 32]</text>
+  <rect x="500" y="860" width="300" height="110" class="box gray"/>
+  <text x="650" y="898" text-anchor="middle" class="h">Gaussian noise ε</text>
+  <text x="650" y="930" text-anchor="middle" class="b">sample_noise()</text>
+  <path d="M385 915 H500" class="arrow"/>
+  <rect x="165" y="1040" width="555" height="125" class="box blue"/>
+  <text x="442" y="1076" text-anchor="middle" class="h">Interpolate at sampled t ∈ [0.001, 1]</text>
+  <text x="442" y="1111" text-anchor="middle" class="b">xₜ = t·ε + (1−t)·a</text>
+  <text x="442" y="1140" text-anchor="middle" class="b">uₜ = ε − a</text>
+  <path d="M235 970 V1040" class="arrow"/><path d="M650 970 V1040" class="arrow"/>
+  <rect x="100" y="1235" width="685" height="145" class="box red"/>
+  <text x="442" y="1271" text-anchor="middle" class="h">Per-token, per-dimension MSE</text>
+  <text x="442" y="1306" text-anchor="middle" class="b">loss = MSE(uₜ, vₜ), reduction='none'</text>
+  <text x="442" y="1338" text-anchor="middle" class="s">stationary action mask keeps 16D; padded 16D excluded</text>
+  <path d="M442 1165 V1235" class="arrow"/>
+  <text x="100" y="1430" class="s">The implementation returns the unreduced loss tensor;</text>
+  <text x="100" y="1455" class="s">the training loop applies the configured action mask/reduction.</text>
+
+  <rect x="935" y="775" width="930" height="740" class="dash"/>
+  <text x="1400" y="814" text-anchor="middle" class="h">Inference: Euler denoising / action chunk</text>
+  <rect x="1000" y="870" width="280" height="115" class="box gray"/>
+  <text x="1140" y="907" text-anchor="middle" class="h">x₁ = Gaussian noise</text>
+  <text x="1140" y="940" text-anchor="middle" class="b">shape [1, 10, 32]</text>
+  <rect x="1370" y="870" width="385" height="115" class="box blue"/>
+  <text x="1562" y="907" text-anchor="middle" class="h">Prefix KV cache</text>
+  <text x="1562" y="940" text-anchor="middle" class="s">vision + language computed once</text>
+  <path d="M1280 928 H1370" class="arrow"/>
+  <rect x="1065" y="1050" width="625" height="155" class="box orange"/>
+  <text x="1377" y="1088" text-anchor="middle" class="h">10 Euler steps: t = 1 → 0</text>
+  <text x="1377" y="1123" text-anchor="middle" class="b">vₜ = denoise_step(state, xₜ, t)</text>
+  <text x="1377" y="1154" text-anchor="middle" class="b">xₜ₊₁ = xₜ − (1/10)·vₜ</text>
+  <text x="1377" y="1182" text-anchor="middle" class="s">num_steps=10 is flow integration steps, not chunk length or output frequency</text>
+  <path d="M1140 985 V1050" class="arrow"/><path d="M1562 985 V1050" class="arrow"/>
+  <rect x="1150" y="1270" width="455" height="115" class="box green"/>
+  <text x="1377" y="1307" text-anchor="middle" class="h">Predicted action chunk</text>
+  <text x="1377" y="1340" text-anchor="middle" class="b">[10, 32] → TianYi valid 16/25D; execution clock is client-defined</text>
+  <path d="M1377 1205 V1270" class="arrow"/>
+  <rect x="1005" y="1430" width="745" height="55" class="box gray"/>
+  <text x="1377" y="1465" text-anchor="middle" class="s">Policy.infer also records policy_timing.infer_ms (wall-clock model inference)</text>
+  <path d="M1377 1385 V1430" class="arrow"/>
+  <text x="1885" y="835" class="t">Legend</text>
+  <rect x="1880" y="855" width="20" height="20" class="box blue"/><text x="1910" y="871" class="t">embedding / token</text>
+  <rect x="1880" y="890" width="20" height="20" class="box orange"/><text x="1910" y="906" class="t">action expert / flow</text>
+  <rect x="1880" y="925" width="20" height="20" class="box green"/><text x="1910" y="941" class="t">TianYi valid data</text>
+</svg>

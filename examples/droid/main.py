@@ -72,9 +72,11 @@ def prevent_keyboard_interrupt():
 
 def main(args: Args):
     # Make sure external camera is specified by user -- we only use one external camera for the policy
-    assert (
-        args.external_camera is not None and args.external_camera in ["left", "right"]
-    ), f"Please specify an external camera to use for the policy, choose from ['left', 'right'], but got {args.external_camera}"
+    if args.external_camera not in ["left", "right"]:
+        raise ValueError(
+            "Please specify an external camera to use for the policy, choose from "
+            f"['left', 'right'], but got {args.external_camera}"
+        )
 
     # Initialize the Panda environment. Using joint velocity action space and gripper position action space is very important.
     env = RobotEnv(action_space="joint_velocity", gripper_action_space="position")
@@ -129,9 +131,17 @@ def main(args: Args):
                     # Wrap the server call in a context manager to prevent Ctrl+C from interrupting it
                     # Ctrl+C will be handled after the server call is complete
                     with prevent_keyboard_interrupt():
-                        # this returns action chunk [10, 8] of 10 joint velocity actions (7) + gripper position (1)
-                        pred_action_chunk = policy_client.infer(request_data)["actions"]
-                    assert pred_action_chunk.shape == (10, 8)
+                        # pi05_droid returns 15 joint-velocity + gripper-position actions.
+                        pred_action_chunk = np.asarray(policy_client.infer(request_data)["actions"])
+                    if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 8:
+                        raise RuntimeError(f"invalid action shape: {pred_action_chunk.shape}")
+                    if pred_action_chunk.shape[0] < args.open_loop_horizon:
+                        raise RuntimeError(
+                            "action chunk shorter than open_loop_horizon: "
+                            f"{pred_action_chunk.shape[0]} < {args.open_loop_horizon}"
+                        )
+                    if not np.isfinite(pred_action_chunk).all():
+                        raise RuntimeError("policy returned NaN or Inf actions")
 
                 # Select current action to execute from chunk
                 action = pred_action_chunk[actions_from_chunk_completed]

@@ -20,10 +20,12 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.tianyi_policy as tianyi_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
+import openpi.training.misc.linglong_config as linglong_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -65,6 +67,13 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional exact local root for a LeRobot dataset. If omitted, LeRobot uses
+    # HF_LEROBOT_HOME / repo_id.
+    dataset_root: str | None = None
+    # Optional text/JSON manifest containing the episode IDs to use.  This is
+    # deliberately kept outside the LeRobot metadata so a held-out split can
+    # be selected without modifying the source dataset.
+    episode_indices_path: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -356,6 +365,65 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotTianyiDataConfig(DataConfigFactory):
+    """LeRobot config for stationary (16D) or mobile (25D) Tianyi data."""
+
+    embodiment: tianyi_policy.TianyiEmbodiment = tianyi_policy.TianyiEmbodiment.STATIONARY
+    dataset_root: str | None = None
+    # Raw Tianyi master actions are absolute. Leave this disabled for the first
+    # training run; when enabled, only the 14 arm joints are converted to deltas.
+    use_delta_joint_actions: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        layout = tianyi_policy.get_layout(self.embodiment)
+        if model_config.action_dim < layout.data_dim:
+            raise ValueError(
+                f"Model action dimension {model_config.action_dim} is smaller than "
+                f"{self.embodiment.value} data dimension {layout.data_dim}."
+            )
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.camera_top",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                tianyi_policy.TianyiInputs(
+                    model_type=model_config.model_type,
+                    embodiment=self.embodiment,
+                    model_action_dim=model_config.action_dim,
+                )
+            ],
+            outputs=[tianyi_policy.TianyiOutputs(embodiment=self.embodiment)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = layout.arm_delta_mask()
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            dataset_root=self.dataset_root,
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -430,35 +498,58 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
     """
 
+    dataset_root: str | None = None
+    episode_indices_path: str | None = None
+    action_space: droid_rlds_dataset.DroidActionSpace = droid_rlds_dataset.DroidActionSpace.JOINT_VELOCITY
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
+                        # Keep the source state/action together.  The
+                        # DROID LeRobot v2.0 state is 14-D and action is 28-D;
+                        # DroidLeRobotInputs below performs the documented
+                        # 28 -> 8 dimensional projection.
+                        "observation/exterior_image_1_left": "observation.images.exterior_image_1_left",
+                        "observation/exterior_image_2_left": "observation.images.exterior_image_2_left",
+                        "observation/wrist_image_left": "observation.images.wrist_image_left",
+                        "observation/state": "observation.state",
+                        "action": "action",
                         "prompt": "prompt",
                     }
                 )
             ]
         )
-        # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[
+                droid_policy.DroidLeRobotInputs(
+                    model_type=model_config.model_type,
+                    action_space=self.action_space,
+                )
+            ],
             outputs=[droid_policy.DroidOutputs()],
         )
+        # Position labels are absolute joint targets in the LeRobot file.  As
+        # in the RLDS DROID recipe, convert only the seven arm dimensions to
+        # deltas before applying the official DROID normalization statistics.
+        if self.action_space == droid_rlds_dataset.DroidActionSpace.JOINT_POSITION:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
         model_transforms = ModelTransformFactory()(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            dataset_root=self.dataset_root,
+            episode_indices_path=self.episode_indices_path,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("action",),
         )
 
 
@@ -514,7 +605,9 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
-    # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
+    # Maximum number of completed PyTorch checkpoints to retain.
+    max_checkpoints: int | None = 5
+    # JAX checkpoint retention option; PyTorch uses max_checkpoints above.
     keep_period: int | None = 5000
 
     # If true, will overwrite the checkpoint directory if it already exists.
@@ -744,7 +837,7 @@ _CONFIGS = [
         name="pi05_libero",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="your_hf_username/libero",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -916,6 +1009,98 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    # Full DreamZero DROID LeRobot-v2.0 finetuning from the local pi05 base.
+    # These two configs intentionally share every training hyperparameter; only
+    # the 8-D action projection/semantics differ, making the comparison fair.
+    TrainConfig(
+        name="pi05_droid_lerobot_joint_velocity_finetune",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotDROIDDataConfig(
+            repo_id="droid",
+            base_config=DataConfig(prompt_from_task=True),
+            dataset_root="/iag_ad_01/ad/xiejinxia/data/DreamZero-DROID-Data",
+            episode_indices_path=(
+                "/iag_ad_01/ad/dushuyue/data/dreamzero_droid_lerobot_split_9to1/"
+                "train_episode_indices.txt"
+            ),
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_VELOCITY,
+            assets=AssetsConfig(
+                assets_dir="/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_base/assets",
+                asset_id="droid",
+            ),
+        ),
+        # PyTorch DDP loads the converted local checkpoint below.  Keep the
+        # JAX loader for compatibility with the standard OpenPI CLI/JAX path.
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_base_pytorch",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=10_000,
+        num_workers=0,
+    ),
+    TrainConfig(
+        name="pi05_droid_lerobot_joint_position_finetune",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotDROIDDataConfig(
+            repo_id="droid",
+            base_config=DataConfig(prompt_from_task=True),
+            dataset_root="/iag_ad_01/ad/xiejinxia/data/DreamZero-DROID-Data",
+            episode_indices_path=(
+                "/iag_ad_01/ad/dushuyue/data/dreamzero_droid_lerobot_split_9to1/"
+                "train_episode_indices.txt"
+            ),
+            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
+            assets=AssetsConfig(
+                assets_dir="/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_base/assets",
+                asset_id="droid",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_base_pytorch",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        num_train_steps=100_000,
+        batch_size=256,
+        log_interval=100,
+        save_interval=5_000,
+        keep_period=10_000,
+        num_workers=0,
+    ),
+    #
+    # Tianyi pi0.5 fine-tuning. This intentionally uses stationary data only.
+    # Tianyi-mobile is supported by LeRobotTianyiDataConfig but is not mixed here.
+    #
+    TrainConfig(
+        name="pi05_tianyi_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+        ),
+        data=LeRobotTianyiDataConfig(
+            repo_id="tianyi",
+            dataset_root="/iag_ad_01/ad/dushuyue/openpi/data/tianyi_lerobot_v21_overlay",
+            embodiment=tianyi_policy.TianyiEmbodiment.STATIONARY,
+            assets=AssetsConfig(asset_id="tianyi"),
+            use_delta_joint_actions=False,
+        ),
+        pytorch_weight_path="/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_base_pytorch",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        max_checkpoints=5,
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
@@ -968,6 +1153,7 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    *linglong_config.get_linglong_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

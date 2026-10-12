@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -127,6 +129,88 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _validate_local_lerobot_metadata(dataset_root: str | None) -> None:
+    if dataset_root is None:
+        return
+
+    root = pathlib.Path(dataset_root)
+    info_path = root / "meta/info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Local LeRobot dataset is missing {info_path}.")
+
+    with info_path.open() as info_file:
+        codebase_version = json.load(info_file).get("codebase_version")
+    episode_stats_path = root / "meta/episodes_stats.jsonl"
+    if codebase_version == "v2.1" and not episode_stats_path.is_file():
+        raise FileNotFoundError(
+            f"Local LeRobot v2.1 dataset is missing {episode_stats_path}. "
+            "Regenerate its metadata before training. OpenPI will not fall back "
+            "to Hugging Face Hub for an explicit local dataset_root."
+        )
+
+
+def _load_episode_indices(path: str, available: dict[int, object]) -> list[int]:
+    """Load an episode-ID manifest without touching LeRobot metadata."""
+    manifest = pathlib.Path(path)
+    if not manifest.is_file():
+        raise FileNotFoundError(f"Episode manifest does not exist: {manifest}")
+    if manifest.suffix == ".json":
+        value = json.loads(manifest.read_text())
+        if isinstance(value, dict):
+            # Accept the split_manifest helper's ``episode_indices`` field.
+            value = value.get("episode_indices", value.get("episodes"))
+        if not isinstance(value, list):
+            raise ValueError(f"Expected a JSON list of episode IDs in {manifest}")
+        indices = [int(x) for x in value]
+    else:
+        indices = [int(line.strip()) for line in manifest.read_text().splitlines() if line.strip()]
+    if not indices:
+        raise ValueError(f"Episode manifest is empty: {manifest}")
+    missing = sorted(set(indices) - set(available))
+    if missing:
+        raise ValueError(f"Episode manifest contains IDs absent from dataset (first 10): {missing[:10]}")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"Episode manifest contains duplicate IDs: {manifest}")
+    return indices
+
+
+def _restore_sparse_episode_index(dataset) -> None:
+    """Make LeRobot v2.0's episode index lookup work for sparse selections.
+
+    LeRobot v2.0 builds ``episode_data_index`` as a compact array when
+    ``episodes=[...]`` is supplied, but ``__getitem__`` subsequently indexes
+    that array with the original ``episode_index`` stored in Parquet.  This is
+    harmless for the full contiguous dataset and fails for an episode manifest
+    (for example, an episode ID of 57542 selected into a 51997-episode split).
+    Expand the two boundary tensors back to original-ID indexing.  The
+    operation only changes the in-memory loader object; no dataset metadata or
+    source files are modified.
+    """
+    episodes = getattr(dataset, "episodes", None)
+    if episodes is None or not episodes:
+        return
+    max_episode_id = max(episodes)
+    # For contiguous selections this is already the representation LeRobot
+    # expects and avoids allocating a second tensor.
+    if max_episode_id < len(episodes):
+        return
+    compact = dataset.episode_data_index
+    dense_size = max_episode_id + 1
+    dense = {
+        key: torch.zeros(dense_size, dtype=value.dtype, device=value.device)
+        for key, value in compact.items()
+    }
+    if len(episodes) != len(compact["from"]):
+        raise ValueError(
+            "LeRobot episode index length does not match the selected episode manifest: "
+            f"{len(compact['from'])=} {len(episodes)=}"
+        )
+    selected = torch.as_tensor(episodes, dtype=torch.long, device=compact["from"].device)
+    dense["from"][selected] = compact["from"]
+    dense["to"][selected] = compact["to"]
+    dataset.episode_data_index = dense
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,13 +221,39 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    _validate_local_lerobot_metadata(data_config.dataset_root)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
+    # Pass all episodes explicitly instead of letting LeRobot call
+    # load_dataset(data_dir=...). On shared VEPFS, concurrent DDP ranks
+    # scanning a symlinked data tree can race while HuggingFace Datasets builds
+    # its Arrow cache and leave a partial dataset whose length no longer matches
+    # meta/episodes.jsonl. Explicit files keep the cache fingerprint deterministic.
+    if data_config.episode_indices_path is not None:
+        episode_indices = _load_episode_indices(data_config.episode_indices_path, dataset_meta.episodes)
+        logging.info("Using %d episodes from manifest %s", len(episode_indices), data_config.episode_indices_path)
+    else:
+        episode_indices = sorted(dataset_meta.episodes)
+    # LeRobot defaults to torchcodec when it is installed. On some cloud worker
+    # images torchcodec can fail to load FFmpeg shared libraries inside a
+    # DataLoader worker even though the main process can import it. Keep the
+    # backend selectable from the launcher without changing the dataset files.
+    # Unset/empty means LeRobot's normal auto-detection. The launcher selects
+    # ``pyav`` on cloud images without FFmpeg shared libraries; ``torchcodec``
+    # is usable only after an explicit import smoke test succeeds.
+    video_backend = os.environ.get("OPENPI_VIDEO_BACKEND") or None
+    if video_backend == "auto":
+        video_backend = None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.dataset_root,
+        episodes=episode_indices,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=video_backend,
     )
+    if data_config.episode_indices_path is not None:
+        _restore_sparse_episode_index(dataset)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

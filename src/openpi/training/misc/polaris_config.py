@@ -1,6 +1,7 @@
 """PolaRiS baseline policy configs."""
 
 from typing import TypeAlias
+import os
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
@@ -31,7 +32,10 @@ def get_polaris_configs():
             model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
             data=RLDSDroidDataConfig(
                 assets=AssetsConfig(
-                    assets_dir="gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris/assets",
+                    assets_dir=os.environ.get(
+                        "OPENPI_PI05_DROID_JOINTPOS_POLARIS_ASSETS",
+                        "/iag_ad_01/ad/dushuyue/openpi/data/checkpoints/pi05_droid_jointpos_polaris/assets",
+                    ),
                     asset_id="droid",
                 ),
                 datasets=(

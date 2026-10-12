@@ -1,6 +1,9 @@
 import dataclasses
+import types
 
 import jax
+import pytest
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +85,63 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_validate_local_lerobot_metadata_requires_v21_episode_stats(tmp_path):
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir()
+    (meta_dir / "info.json").write_text('{"codebase_version": "v2.1"}')
+
+    with pytest.raises(FileNotFoundError, match="episodes_stats.jsonl"):
+        _data_loader._validate_local_lerobot_metadata(str(tmp_path))
+
+
+def test_validate_local_lerobot_metadata_accepts_complete_v21_metadata(tmp_path):
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir()
+    (meta_dir / "info.json").write_text('{"codebase_version": "v2.1"}')
+    (meta_dir / "episodes_stats.jsonl").write_text("")
+
+    _data_loader._validate_local_lerobot_metadata(str(tmp_path))
+
+
+def test_validate_local_lerobot_metadata_accepts_default_cache():
+    _data_loader._validate_local_lerobot_metadata(None)
+
+
+def test_load_episode_indices_text_and_json(tmp_path):
+    available = {0: {}, 2: {}}
+    txt = tmp_path / "episodes.txt"
+    txt.write_text("0\n2\n")
+    assert _data_loader._load_episode_indices(str(txt), available) == [0, 2]
+    js = tmp_path / "episodes.json"
+    js.write_text('{"episode_indices": [2, 0]}')
+    assert _data_loader._load_episode_indices(str(js), available) == [2, 0]
+
+
+def test_load_episode_indices_rejects_missing_and_duplicate(tmp_path):
+    available = {0: {}}
+    missing = tmp_path / "missing.txt"
+    missing.write_text("3\n")
+    with pytest.raises(ValueError, match="absent"):
+        _data_loader._load_episode_indices(str(missing), available)
+    duplicate = tmp_path / "duplicate.txt"
+    duplicate.write_text("0\n0\n")
+    with pytest.raises(ValueError, match="duplicate"):
+        _data_loader._load_episode_indices(str(duplicate), available)
+
+
+def test_restore_sparse_episode_index():
+    dataset = types.SimpleNamespace(
+        episodes=[0, 4, 9],
+        episode_data_index={
+            "from": torch.tensor([0, 3, 8]),
+            "to": torch.tensor([3, 8, 10]),
+        },
+    )
+
+    _data_loader._restore_sparse_episode_index(dataset)
+
+    assert len(dataset.episode_data_index["from"]) == 10
+    assert dataset.episode_data_index["from"][[0, 4, 9]].tolist() == [0, 3, 8]
+    assert dataset.episode_data_index["to"][[0, 4, 9]].tolist() == [3, 8, 10]

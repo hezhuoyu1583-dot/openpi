@@ -211,7 +211,14 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        squared_error = jnp.square(v_t - u_t)
+        if observation.action_dim_mask is None:
+            return jnp.mean(squared_error, axis=-1)
+
+        action_dim_mask = jnp.asarray(observation.action_dim_mask, dtype=squared_error.dtype)
+        masked_error = squared_error * action_dim_mask[..., None, :]
+        valid_dims = jnp.maximum(jnp.sum(action_dim_mask, axis=-1, keepdims=True), 1)
+        return jnp.sum(masked_error, axis=-1) / valid_dims
 
     @override
     def sample_actions(

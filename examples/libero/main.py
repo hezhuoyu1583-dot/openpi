@@ -36,6 +36,11 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    task_id: int | None = None  # If set, only run this task_id (env/bddl/init_states), instead of the whole suite
+    prompt_task_id: int | None = None  # If set, feed the model the instruction from this task_id instead of the
+    # actual task's instruction. The environment (bddl, init state, success condition) is unaffected -- this is
+    # purely for testing counterfactual/unachievable instructions (e.g. asking to grab an object that isn't
+    # present, or to place something in a drawer that was never opened).
 
     #################################################################################################################
     # Utils
@@ -48,6 +53,11 @@ class Args:
 def eval_libero(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
+
+    # Add timestamp to video output path
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.video_out_path = f"{args.video_out_path}/{timestamp}"
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -74,7 +84,8 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_ids = [args.task_id] if args.task_id is not None else list(range(num_tasks_in_suite))
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -83,6 +94,15 @@ def eval_libero(args: Args) -> None:
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+
+        # If requested, swap in another task's instruction as the prompt fed to the model, while keeping this
+        # task's environment (bddl file, init states, success condition) unchanged. This lets you test how the
+        # model/sim behave when told to do something that doesn't match reality.
+        prompt_description = task_description
+        if args.prompt_task_id is not None:
+            prompt_description = task_suite.get_task(args.prompt_task_id).language
+            logging.info(f"Counterfactual prompt: using task {args.prompt_task_id}'s instruction "
+                         f"('{prompt_description}') in task {task_id}'s environment ('{task_description}')")
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -121,8 +141,8 @@ def eval_libero(args: Args) -> None:
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
 
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    # Save preprocessed image for replay video: agentview (left) + wrist view (right)
+                    replay_images.append(np.concatenate([img, wrist_img], axis=1))
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -137,7 +157,7 @@ def eval_libero(args: Args) -> None:
                                     obs["robot0_gripper_qpos"],
                                 )
                             ),
-                            "prompt": str(task_description),
+                            "prompt": str(prompt_description),
                         }
 
                         # Query model to get action
@@ -167,6 +187,8 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
+            if args.prompt_task_id is not None:
+                task_segment += f"_promptFROM_{prompt_description.replace(' ', '_')}"
             imageio.mimwrite(
                 pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],

@@ -30,6 +30,7 @@ import os
 import platform
 import shutil
 import time
+from datetime import timedelta
 
 import jax
 import numpy as np
@@ -72,7 +73,7 @@ def init_logging():
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     """Initialize wandb logging."""
     if not enabled:
-        wandb.init(mode="disabled")
+        logging.info("WANDB_DISABLED: skipping wandb.init entirely")
         return
 
     ckpt_dir = config.checkpoint_dir
@@ -94,18 +95,25 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        ddp_timeout_seconds = int(os.environ.get("OPENPI_DDP_TIMEOUT_SECONDS", "3600"))
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(seconds=ddp_timeout_seconds),
+        )
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
+    logging.info("DDP_READY rank=%s local_rank=%s device=%s world_size=%s pid=%s",
+                 os.environ.get("RANK", "0"), local_rank, device, world_size, os.getpid())
     return use_ddp, local_rank, device
 
 
@@ -123,8 +131,25 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    # Build the HuggingFace/LeRobot Arrow cache once on rank 0. On the shared
+    # VEPFS filesystem, having all DDP ranks call load_dataset() concurrently
+    # can expose a partially generated Arrow dataset to some ranks. The other
+    # ranks wait at the barrier and then open the completed, read-only cache.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        barrier_args = {"device_ids": [torch.cuda.current_device()]} if dist.get_backend() == "nccl" else {}
+        if dist.get_rank() == 0:
+            logging.info("DATA_BUILD_START rank=0 pid=%s", os.getpid())
+            data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+            logging.info("DATA_BUILD_DONE rank=0; entering barrier")
+            dist.barrier(**barrier_args)
+        else:
+            logging.info("DATA_WAIT rank=%s pid=%s; waiting for rank0", dist.get_rank(), os.getpid())
+            dist.barrier(**barrier_args)
+            logging.info("DATA_BUILD_START rank=%s", dist.get_rank())
+            data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+            logging.info("DATA_BUILD_DONE rank=%s", dist.get_rank())
+    else:
+        data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
 
@@ -144,6 +169,22 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def _prune_checkpoints(checkpoint_dir, max_checkpoints: int | None) -> None:
+    """Keep only the newest completed numeric checkpoints."""
+    if max_checkpoints is None:
+        return
+    if max_checkpoints < 1:
+        raise ValueError(f"max_checkpoints must be positive or None, got {max_checkpoints}.")
+
+    completed = sorted(
+        (path for path in checkpoint_dir.iterdir() if path.is_dir() and path.name.isdigit()),
+        key=lambda path: int(path.name),
+    )
+    for stale_checkpoint in completed[:-max_checkpoints]:
+        shutil.rmtree(stale_checkpoint)
+        logging.info("Removed stale checkpoint: %s", stale_checkpoint)
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
@@ -186,6 +227,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if final_ckpt_dir.exists():
             shutil.rmtree(final_ckpt_dir)
         tmp_ckpt_dir.rename(final_ckpt_dir)
+        _prune_checkpoints(config.checkpoint_dir, config.max_checkpoints)
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
@@ -344,7 +386,9 @@ def train_loop(config: _config.TrainConfig):
 
     # Initialize wandb (only on main process)
     if is_main:
+        logging.info("WANDB_INIT_START rank=0 enabled=%s pid=%s", config.wandb_enabled, os.getpid())
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        logging.info("WANDB_INIT_DONE rank=0")
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -408,7 +452,8 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
-    if hasattr(model, "gradient_checkpointing_enable"):
+    enable_gc = os.environ.get("OPENPI_GRADIENT_CHECKPOINTING", "1") != "0"
+    if enable_gc and hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
@@ -433,7 +478,7 @@ def train_loop(config: _config.TrainConfig):
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
+            find_unused_parameters=os.environ.get("OPENPI_DDP_FIND_UNUSED", "0") == "1",
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
@@ -533,7 +578,13 @@ def train_loop(config: _config.TrainConfig):
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+            if observation.action_dim_mask is None:
+                loss = losses.mean()
+            else:
+                action_dim_mask = observation.action_dim_mask.to(dtype=losses.dtype)
+                masked_losses = losses * action_dim_mask[:, None, :]
+                losses_per_step = masked_losses.sum(dim=-1) / action_dim_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+                loss = losses_per_step.mean()
 
             # Backward pass
             loss.backward()

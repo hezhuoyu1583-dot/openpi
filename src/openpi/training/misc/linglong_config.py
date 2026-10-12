@@ -34,7 +34,7 @@ def get_linglong_configs():
         optimizer=optimizer.AdamW(clip_gradient_norm=1.),batch_size=64,num_workers=0,
         num_train_steps=5000,save_interval=500,log_interval=20,max_checkpoints=None,wandb_enabled=False,
         policy_metadata={'layout':policy.LAYOUT,'prompt':policy.PROMPT,'motion_enabled':False,
-                         'action_semantics':'absolute q_exp','fps':15})
+                         'action_semantics':'absolute ee pose xyz+rpy rad and gripper','fps':15})
     # Separate task and assets; keep 0714/DROID experiments unchanged.
     new_root=root/'data/linglong_0923_sft_train_15hz'
     pick_place=dataclasses.replace(original,name='pi05_linglong_0923_sft',

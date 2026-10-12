@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 import numpy as np
 import datasets
-from openpi.policies.linglong_policy import PROMPT, LAYOUT
+from openpi.policies.linglong_policy import PROMPT
+
+# Joint export layout. Training now expects the 14D end-effector contract instead.
+JOINT_LAYOUT = "left7,left_gripper,right7,right_gripper,waist4,head2,base2"
 
 def write(path,value):
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -101,7 +104,7 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         for key,v in [('state',x[:,:24]),('actions',x[:,24:])]:
             norm[key]={k:arr.tolist() for k,arr in {'mean':v.mean(0),'std':v.std(0),'q01':np.quantile(v,.01,axis=0),'q99':np.quantile(v,.99,axis=0)}.items()}
     write(output/'assets/linglong_h/norm_stats.json',{'norm_stats':norm})
-    write(output/'manifest.json',{'status':'complete','prompt':prompt,'layout':LAYOUT,'source_root':str(source.resolve()),
+    write(output/'manifest.json',{'status':'complete','prompt':prompt,'layout':JOINT_LAYOUT,'source_root':str(source.resolve()),
         'source_inventory_sha256':hashlib.sha256((source/'inventory.json').read_bytes()).hexdigest(),
         'source_episodes':len(inventory),'segments':len(episodes),'train_segments':len(train),'validation_segments':len(val),
         'frames':offset,'train_stat_frames':stat_frames,'norm_reference':str(norm_reference) if norm_reference else None,'rejected_grid_rows':rejected,'discarded_short_segment_rows':short,

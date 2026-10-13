@@ -40,7 +40,10 @@ if __name__=='__main__':
     install_hook(module)
     module.init_logging()
     config=module._config.cli()
-    if config.name not in ('pi05_linglong_sft','pi05_linglong_0923_sft'): raise ValueError('Linglong-only entry point')
+    if config.name not in ('pi05_linglong_sft','pi05_linglong_0923_sft','pi05_linglong_0923_1010_eef_sft'):
+        raise ValueError('Linglong-only entry point')
+    from openpi.training.misc.linglong_config import sync_policy_metadata
+    config=sync_policy_metadata(config)
     # Outside checkpoint_dir: the shared trainer checks its existence on startup.
     handlers=[]
     if int(os.environ.get('RANK','0'))==0:
@@ -51,7 +54,9 @@ if __name__=='__main__':
         file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         handlers=[file_handler,MetricsHandler(log_dir)]
         for handler in handlers:logging.getLogger().addHandler(handler)
-        logging.info('Linglong run start: resume=%s config=%s metrics_run_id=%s',config.resume,config.name,handlers[1].run_id)
+        logging.info('Linglong run start: resume=%s config=%s state=%s action=%s metrics_run_id=%s',
+                     config.resume,config.name,config.policy_metadata.get('state_key'),
+                     config.policy_metadata.get('action_key'),handlers[1].run_id)
     try:
         module.train_loop(config)
     except BaseException:

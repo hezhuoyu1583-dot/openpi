@@ -1,19 +1,182 @@
-"""Build a local image-reference LeRobot v2.1 dataset; never alter source records."""
+"""Build a local image-reference LeRobot v2.1 dataset; never alter source records.
+
+Joint columns stay 24D. state_eef is the logged /end_pos pose plus the measured
+gripper. action_eef is end_frames() of the commanded joints: wrist_yaw_link
+orientation and the wrist-frame TCP point. Both are 16D xyz + quaternion wxyz
++ gripper.
+"""
 import argparse
 import csv
 import hashlib
+import importlib.util
 import json
+import sqlite3
+import sys
 from pathlib import Path
 import numpy as np
 import datasets
 from openpi.policies.linglong_policy import PROMPT
 
-# Joint export layout. Training now expects the 14D end-effector contract instead.
+# Joint export layout. The training entry reads state_eef and action_eef.
 JOINT_LAYOUT = "left7,left_gripper,right7,right_gripper,waist4,head2,base2"
+EEF_LAYOUT = "left_xyz3_quat_wxyz4_gripper,right_xyz3_quat_wxyz4_gripper"
+EEF_DIM = 16
+PARSER = Path("/iag_ad_01/ad/zhengyuan/yyzj/linglong_rawdata_spec")
+END_FRAMES = Path("/iag_ad_01/ad/zhengyuan/yyzj/linglong-h-robot/tool/eval_stitch_error.py")
+MAX_END_AGE_NS = 80_000_000
 
 def write(path,value):
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(value,ensure_ascii=False,indent=2,default=lambda x:x.item() if isinstance(x,np.generic) else str(x)))
+
+def load_eef_modules():
+    sys.path.insert(0, str(PARSER))
+    import linglong_parser as parser
+    spec = importlib.util.spec_from_file_location("linglong_end_frames", END_FRAMES)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return parser, module.end_frames
+
+def bag_path(source, record):
+    episode = record["episode"]
+    local = source / "raw" / episode / "bag" / "bag_0.db3"
+    if local.is_file():
+        return local
+    archived = Path(record["archive_member"]).parent / "bag" / "bag_0.db3"
+    if archived.is_file():
+        return archived
+    raise FileNotFoundError(f"no bag for {episode}: tried {local} and {archived}")
+
+def load_end_poses(parser, db_path):
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        topics = {name: topic_id for topic_id, name, *_ in connection.execute(
+            "SELECT id,name,type,serialization_format FROM topics")}
+        topic_id = topics["/end_pos"]
+        poses = {}
+        for payload, in connection.execute("SELECT data FROM messages WHERE topic_id=?", (topic_id,)):
+            message = parser.decode_end_pos(payload)
+            poses[int(message["timestamp_ns"])] = message
+    finally:
+        connection.close()
+    if not poses:
+        raise ValueError(f"no /end_pos messages in {db_path}")
+    return poses
+
+def rpy_to_matrix(roll, pitch, yaw):
+    """R = Rz(yaw) @ Ry(pitch) @ Rx(roll), the end_frames convention."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ], dtype=np.float64)
+
+def matrix_to_quat(rotation):
+    """Rotation matrix to wxyz quaternion."""
+    matrix = np.asarray(rotation, dtype=np.float64)
+    trace = np.trace(matrix)
+    if trace > 0.0:
+        scale = np.sqrt(trace + 1.0) * 2.0
+        quat = np.array([
+            0.25 * scale,
+            (matrix[2, 1] - matrix[1, 2]) / scale,
+            (matrix[0, 2] - matrix[2, 0]) / scale,
+            (matrix[1, 0] - matrix[0, 1]) / scale,
+        ])
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        quat = np.array([
+            (matrix[2, 1] - matrix[1, 2]) / scale,
+            0.25 * scale,
+            (matrix[0, 1] + matrix[1, 0]) / scale,
+            (matrix[0, 2] + matrix[2, 0]) / scale,
+        ])
+    elif matrix[1, 1] > matrix[2, 2]:
+        scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        quat = np.array([
+            (matrix[0, 2] - matrix[2, 0]) / scale,
+            (matrix[0, 1] + matrix[1, 0]) / scale,
+            0.25 * scale,
+            (matrix[1, 2] + matrix[2, 1]) / scale,
+        ])
+    else:
+        scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        quat = np.array([
+            (matrix[1, 0] - matrix[0, 1]) / scale,
+            (matrix[0, 2] + matrix[2, 0]) / scale,
+            (matrix[1, 2] + matrix[2, 1]) / scale,
+            0.25 * scale,
+        ])
+    return quat / np.linalg.norm(quat)
+
+def continuous_quaternions(quaternions):
+    out = np.asarray(quaternions, dtype=np.float64).copy()
+    for index in range(1, len(out)):
+        if np.dot(out[index], out[index - 1]) < 0.0:
+            out[index] *= -1.0
+    return out
+
+def recorded_pose(message, arm):
+    values = np.asarray(message["ee_pose_l" if arm == "left" else "ee_pose_r"], dtype=np.float64)
+    if values.shape != (7,) or not np.isfinite(values).all():
+        raise ValueError(f"recorded {arm} pose must be finite (7,)")
+    return values[:3], rpy_to_matrix(*values[3:6])
+
+def pack(position, rotation, gripper):
+    return np.concatenate([position, matrix_to_quat(rotation), [gripper]])
+
+def geodesic_deg(first, second):
+    relative = np.swapaxes(first, -1, -2) @ second
+    trace = relative[..., 0, 0] + relative[..., 1, 1] + relative[..., 2, 2]
+    return np.degrees(np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0)))
+
+def end_message(alignment_row, poses):
+    head_ns = int(alignment_row["timestamp_ns"])
+    end_ns = int(alignment_row["source_timestamps"]["end_pos"])
+    if abs(end_ns - head_ns) > MAX_END_AGE_NS:
+        raise ValueError(f"end_pos is more than 80 ms from the head frame at {head_ns}")
+    message = poses.get(end_ns)
+    if message is None:
+        raise ValueError(f"aligned end_pos timestamp {end_ns} is missing")
+    return message
+
+def eef_for_rows(state, action, messages, end_frames):
+    """Logged state_eef and forward-kinematics action_eef, both (T, 16)."""
+    state = np.asarray(state, dtype=np.float64)
+    action = np.asarray(action, dtype=np.float64)
+    state_eef = np.empty((len(state), EEF_DIM), dtype=np.float64)
+    recorded_rot = np.empty((len(state), 2, 3, 3), dtype=np.float64)
+    for row, message in enumerate(messages):
+        for hand, arm, gripper_index in ((0, "left", 7), (1, "right", 15)):
+            position, rotation = recorded_pose(message, arm)
+            recorded_rot[row, hand] = rotation
+            state_eef[row, hand * 8:(hand + 1) * 8] = pack(position, rotation, state[row, gripper_index])
+    positions, rotations = end_frames(action)
+    action_eef = np.empty_like(state_eef)
+    for hand, gripper_index in ((0, 7), (1, 15)):
+        for row in range(len(action)):
+            action_eef[row, hand * 8:(hand + 1) * 8] = pack(
+                positions[row, hand], rotations[row, hand], action[row, gripper_index])
+    for values in (state_eef, action_eef):
+        for hand in (0, 1):
+            values[:, hand * 8 + 3:hand * 8 + 7] = continuous_quaternions(values[:, hand * 8 + 3:hand * 8 + 7])
+    if not np.isfinite(state_eef).all() or not np.isfinite(action_eef).all():
+        raise ValueError("non-finite end-effector values")
+    state_positions, state_rotations = end_frames(state)
+    recorded_positions = np.stack([state_eef[:, 0:3], state_eef[:, 8:11]], axis=1)
+    position_mm = np.linalg.norm(recorded_positions - state_positions, axis=-1) * 1000.0
+    orientation_deg = geodesic_deg(recorded_rot, state_rotations)
+    return state_eef, action_eef, position_mm, orientation_deg
+
+def quantile_stats(values):
+    values = np.asarray(values, dtype=np.float64)
+    return {name: arr.tolist() for name, arr in {
+        "mean": values.mean(0), "std": values.std(0),
+        "q01": np.quantile(values, 0.01, axis=0), "q99": np.quantile(values, 0.99, axis=0),
+    }.items()}
 
 def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_reference=None):
     if not 0 <= train_fraction <= 1: raise ValueError('train_fraction must be in [0,1]')
@@ -23,13 +186,20 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
     inventory.sort(key=lambda r:r['metadata']['startAt'])
     train_sources={r['episode'] for r in inventory[:int(train_fraction*len(inventory))]}
     features={k:{'dtype':'float32','shape':[24],'names':None} for k in ('observation.state','action')}
+    features.update({k:{'dtype':'float32','shape':[EEF_DIM],'names':None} for k in ('state_eef','action_eef')})
     for cam,shape in [('head',[3,720,960]),('left',[3,540,960]),('right',[3,540,960])]:
         features['observation.images.'+cam]={'dtype':'image','shape':shape,'names':['channels','height','width']}
     for k in ('timestamp','frame_index','episode_index','index','task_index'):
         features[k]={'dtype':'float32' if k=='timestamp' else 'int64','shape':[1],'names':None}
-    hf=datasets.Features({k:(datasets.Image() if v['dtype']=='image' else
-        datasets.Sequence(datasets.Value('float32'),length=24) if v['shape']==[24] else datasets.Value(v['dtype'])) for k,v in features.items()})
+    def feature(spec):
+        if spec['dtype']=='image': return datasets.Image()
+        if spec['dtype']=='float32' and spec['shape']!=[1]:
+            return datasets.Sequence(datasets.Value('float32'),length=spec['shape'][0])
+        return datasets.Value(spec['dtype'])
+    hf=datasets.Features({k:feature(v) for k,v in features.items()})
+    parser,end_frames=load_eef_modules()
     episodes=[]; stats_rows=[]; mapping=[]; train=[]; val=[]; stats_arrays=[]; offset=0
+    eef_state_parts=[]; eef_action_parts=[]; position_errors=[]; orientation_errors=[]
     rejected=0; short=0
     for rec in inventory:
         eid=rec['episode']; path=source/'decoded'/eid
@@ -55,11 +225,16 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         if not all(good) or not raw_ok:
             print(f'{eid}: excluded whole episode',flush=True)
             continue
+        poses=load_end_poses(parser,bag_path(source,rec))
         bounds=np.flatnonzero(np.diff(np.r_[False,good,False])).reshape(-1,2)
         for start,end in bounds:
             if end-start<25: short+=int(end-start); continue
             selection=indices[start:end]; n=len(selection); ep=len(episodes)
+            messages=[end_message(alignment[int(i)],poses) for i in selection]
+            state_eef,action_eef,pos_mm,ang_deg=eef_for_rows(q[selection],a[selection],messages,end_frames)
+            position_errors.append(pos_mm); orientation_errors.append(ang_deg)
             values={'observation.state':q[selection].tolist(),'action':a[selection].tolist(),
+                    'state_eef':state_eef.astype(np.float32).tolist(),'action_eef':action_eef.astype(np.float32).tolist(),
                     'timestamp':(np.arange(n,dtype=np.float32)/15).tolist(),'frame_index':list(range(n)),
                     'episode_index':[ep]*n,'index':list(range(offset,offset+n)),'task_index':[0]*n}
             dest=output/f'data/chunk-{ep//1000:03d}/episode_{ep:06d}.parquet'; dest.parent.mkdir(parents=True,exist_ok=True)
@@ -71,16 +246,19 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
                 datasets.Dataset.from_dict(values,features=hf).to_parquet(str(dest))
             else:
                 import pyarrow.parquet as pq
-                saved=pq.read_table(dest,columns=['observation.state','action'])
-                if saved.num_rows!=n or not np.array_equal(np.array(saved['action'].to_pylist()),a[selection]) or not np.array_equal(np.array(saved['observation.state'].to_pylist()),q[selection]):
-                    raise ValueError('resume content mismatch: '+str(dest))
+                saved=pq.read_table(dest,columns=['observation.state','action','state_eef','action_eef'])
+                same=saved.num_rows==n and np.array_equal(np.array(saved['action'].to_pylist()),a[selection]) and np.array_equal(np.array(saved['observation.state'].to_pylist()),q[selection])
+                same=same and np.allclose(np.array(saved['state_eef'].to_pylist()),state_eef,atol=1e-5) and np.allclose(np.array(saved['action_eef'].to_pylist()),action_eef,atol=1e-5)
+                if not same: raise ValueError('resume content mismatch: '+str(dest))
             episodes.append({'episode_index':ep,'tasks':[prompt],'length':n})
             sr={}
-            for k,v in [('observation.state',q[selection]),('action',a[selection])]:
+            for k,v in [('observation.state',q[selection]),('action',a[selection]),('state_eef',state_eef),('action_eef',action_eef)]:
                 sr[k]={name:arr.tolist() for name,arr in {'min':v.min(0),'max':v.max(0),'mean':v.mean(0),'std':v.std(0),'count':np.array([n])}.items()}
             stats_rows.append({'episode_index':ep,'stats':sr})
             is_train=eid in train_sources; (train if is_train else val).append(ep)
-            if is_train: stats_arrays.append(np.concatenate([q[selection],a[selection]],axis=1))
+            if is_train:
+                stats_arrays.append(np.concatenate([q[selection],a[selection]],axis=1))
+                eef_state_parts.append(state_eef); eef_action_parts.append(action_eef)
             mapping.append({'episode_index':ep,'source_id':eid,'archive_member':rec['archive_member'],
                             'split':'train' if is_train else 'validation','grid_start_ns':int(grid[start]),
                             'source_row_indices':selection.tolist(),'length':n})
@@ -95,22 +273,39 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         'video_path':None,'features':features})
     write(output/'train_episodes.json',train); write(output/'validation_episodes.json',val)
     write(output/'source_mapping.json',mapping)
-    norm={}; stat_frames=0
+    norm={}; eef_norm={}; stat_frames=0; qa={}
+    if position_errors:
+        position_errors=np.concatenate(position_errors); orientation_errors=np.concatenate(orientation_errors)
+        if np.median(position_errors)>10.0:
+            raise ValueError('recorded end position disagrees with end_frames by more than 10 mm median')
+        if np.median(orientation_errors)>5.0:
+            raise ValueError('recorded end orientation disagrees with wrist_yaw end_frames by more than 5 deg median')
+        qa={'left_position_mm':float(np.median(position_errors[:,0])),'right_position_mm':float(np.median(position_errors[:,1])),
+            'left_orientation_deg':float(np.median(orientation_errors[:,0])),'right_orientation_deg':float(np.median(orientation_errors[:,1]))}
     if norm_reference is not None:
-        norm=json.loads(Path(norm_reference).read_text())['norm_stats']
+        reference=Path(norm_reference)
+        norm=json.loads(reference.read_text())['norm_stats']
+        eef_reference=reference.parent/'eef_norm_stats.json'
+        if not eef_reference.is_file(): raise ValueError(f'missing {eef_reference}')
+        eef_norm=json.loads(eef_reference.read_text())['norm_stats']
     else:
         if not stats_arrays: raise ValueError('No training frames for normalization')
         x=np.concatenate(stats_arrays).astype(np.float64); stat_frames=len(x)
         for key,v in [('state',x[:,:24]),('actions',x[:,24:])]:
-            norm[key]={k:arr.tolist() for k,arr in {'mean':v.mean(0),'std':v.std(0),'q01':np.quantile(v,.01,axis=0),'q99':np.quantile(v,.99,axis=0)}.items()}
+            norm[key]=quantile_stats(v)
+        eef_norm={'state_eef':quantile_stats(np.concatenate(eef_state_parts)),
+                  'action_eef':quantile_stats(np.concatenate(eef_action_parts))}
     write(output/'assets/linglong_h/norm_stats.json',{'norm_stats':norm})
-    write(output/'manifest.json',{'status':'complete','prompt':prompt,'layout':JOINT_LAYOUT,'source_root':str(source.resolve()),
+    write(output/'assets/linglong_h/eef_norm_stats.json',{'norm_stats':eef_norm})
+    write(output/'manifest.json',{'status':'complete','prompt':prompt,'layout':JOINT_LAYOUT,'eef_layout':EEF_LAYOUT,'source_root':str(source.resolve()),
         'source_inventory_sha256':hashlib.sha256((source/'inventory.json').read_bytes()).hexdigest(),
         'source_episodes':len(inventory),'segments':len(episodes),'train_segments':len(train),'validation_segments':len(val),
         'frames':offset,'train_stat_frames':stat_frames,'norm_reference':str(norm_reference) if norm_reference else None,'rejected_grid_rows':rejected,'discarded_short_segment_rows':short,
         'resampling':'15Hz nearest head <=20ms; all streams absolute age <=80ms; reject whole source if any invalid grid row, original head gap >50ms or original aligned age >80ms',
         'image_storage':'absolute original JPEG references; source must remain accessible',
-        'action_semantics':'absolute q_exp','success_filter':'none; success labels unavailable',
+        'action_semantics':'absolute q_exp','state_eef':'logged /end_pos xyz and wrist orientation, gripper from measured joints 7 and 15',
+        'action_eef':'end_frames(action) wrist_yaw_link pose plus wrist-frame TCP, gripper from commanded joints 7 and 15',
+        'recorded_vs_end_frames':qa,'success_filter':'none; success labels unavailable',
         'split':f'chronological source episodes train fraction {train_fraction}; train/validation JSON overrides meta full coverage'})
 
 if __name__=='__main__':

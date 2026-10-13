@@ -103,6 +103,7 @@ def merge(sources, output, check_image_files):
     mapping = []
     tasks = []
     stat_parts = []
+    eef_parts = []
     offset = 0
     for source in loaded:
         for origin_episode in source["selected"]:
@@ -157,6 +158,22 @@ def merge(sources, output, check_image_files):
             })
             mapping.append(origin)
             stat_parts.append(np.concatenate([state, action], axis=1))
+            if "state_eef" in table.column_names:
+                state_eef = np.asarray(table["state_eef"].to_pylist(), dtype=np.float64)
+                action_eef = np.asarray(table["action_eef"].to_pylist(), dtype=np.float64)
+                if state_eef.shape != (length, 16) or action_eef.shape != (length, 16):
+                    raise ValueError(f"expected {(length, 16)} state_eef and action_eef in {path}")
+                if not np.isfinite(state_eef).all() or not np.isfinite(action_eef).all():
+                    raise ValueError(f"non-finite end-effector values in {path}")
+                for key, values in (("state_eef", state_eef), ("action_eef", action_eef)):
+                    episode_stats[key] = {
+                        "min": values.min(0).tolist(),
+                        "max": values.max(0).tolist(),
+                        "mean": values.mean(0).tolist(),
+                        "std": values.std(0).tolist(),
+                        "count": [length],
+                    }
+                eef_parts.append(np.concatenate([state_eef, action_eef], axis=1))
             offset += length
             print(f"{source['root'].name} episode {origin_episode} -> {episode_index} frames={offset}", flush=True)
 
@@ -188,6 +205,17 @@ def merge(sources, output, check_image_files):
     write_json(output / "validation_episodes.json", [])
     write_json(output / "source_mapping.json", mapping)
     write_json(output / "assets/linglong_h/norm_stats.json", {"norm_stats": norm})
+    if eef_parts:
+        eef = np.concatenate(eef_parts).astype(np.float64)
+        eef_norm = {}
+        for key, values in (("state_eef", eef[:, :16]), ("action_eef", eef[:, 16:])):
+            eef_norm[key] = {
+                "mean": values.mean(0).tolist(),
+                "std": values.std(0).tolist(),
+                "q01": np.quantile(values, 0.01, axis=0).tolist(),
+                "q99": np.quantile(values, 0.99, axis=0).tolist(),
+            }
+        write_json(output / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": eef_norm})
     per_source = []
     for source in loaded:
         per_source.append({

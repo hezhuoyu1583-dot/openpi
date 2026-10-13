@@ -50,7 +50,8 @@ def sync_policy_metadata(config):
     data=config.data
     if not hasattr(data,'eef'): return config
     state_eef,action_eef=policy.resolve_encoding(data.eef, data.state_encoding)
-    return dataclasses.replace(config, policy_metadata={**config.policy_metadata, **encoding_metadata(state_eef, action_eef)})
+    return dataclasses.replace(config, policy_metadata={**config.policy_metadata, **encoding_metadata(state_eef, action_eef),
+        'dataset_root':str(Path(data.dataset_root))})
 
 def get_linglong_configs():
     from openpi.training import config as c
@@ -59,6 +60,8 @@ def get_linglong_configs():
 
     @dataclasses.dataclass(frozen=True)
     class LinglongData(c.DataConfigFactory):
+        # Episodes and both norm-stats files come from this directory.
+        # Override it with --data.dataset-root; the assets directory follows.
         dataset_root: str = str(Path(__file__).resolve().parents[4]/'data/linglong_0714_sft_15hz')
         # Action column and loss mask. The state written into the prompt follows this
         # unless state_encoding is set on the command line.
@@ -66,7 +69,10 @@ def get_linglong_configs():
         state_encoding: Literal['joint', 'eef'] | None = None
         def create(self, assets_dirs, model_config):
             root=Path(self.dataset_root)
-            base=self.create_base_config(assets_dirs,model_config)
+            asset_id=self.assets.asset_id or 'linglong_h'
+            aligned=dataclasses.replace(self, assets=dataclasses.replace(
+                self.assets, assets_dir=str(root/'assets'), asset_id=asset_id))
+            base=aligned.create_base_config(assets_dirs,model_config)
             state_eef,action_eef=policy.resolve_encoding(self.eef, self.state_encoding)
             state_key='state_eef' if state_eef else 'observation.state'
             action_key='action_eef' if action_eef else 'action'

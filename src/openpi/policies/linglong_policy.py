@@ -5,6 +5,9 @@ the supervised action. Joint state/action is 24D (left7, gripper, right7,
 gripper, waist4, head2, base2); the base pair is not supervised. EEF
 state/action is 16D: xyz, quaternion wxyz, gripper, for each arm. Orientation
 is wrist_yaw_link. Both are padded to the pi0.5 width of 32.
+
+Absolute end-effector actions use the pi0.5 control-mode prefix. Joint actions
+stay unmarked, matching the released base checkpoint.
 """
 import dataclasses
 import numpy as np
@@ -18,6 +21,14 @@ JOINT_SUPERVISED = 22
 EEF_DIM = 16
 STATE_DIM = EEF_DIM
 MODEL_ACTION_DIM = 32
+# Official absolute end-effector marker. Joint position actions have no marker.
+EEF_CONTROL_MODE = "<control_mode> end effector </control_mode>"
+
+def with_eef_control_mode(prompt):
+    text = prompt.strip()
+    if text.startswith(EEF_CONTROL_MODE):
+        return text
+    return f"{EEF_CONTROL_MODE} {text}"
 
 def resolve_encoding(action_eef, state_encoding=None):
     """Return (state_eef, action_eef). An omitted state encoding follows the action."""
@@ -49,9 +60,16 @@ class LinglongInputs:
                 im = np.rint(im*255).astype(np.uint8)
             if im.dtype != np.uint8: raise ValueError('image must be uint8 or float [0,1]')
             images[target] = im
+        prompt = data.get('prompt', PROMPT)
+        if self.action_eef:
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode('utf-8')
+            elif not isinstance(prompt, str):
+                prompt = prompt.item()
+            prompt = with_eef_control_mode(prompt)
         out = {'state':state,'image':images,'image_mask':{k:np.True_ for k in images},
                'action_dim_mask':np.array([True]*supervised+[False]*(MODEL_ACTION_DIM-supervised)),
-               'prompt':data.get('prompt',PROMPT)}
+               'prompt':prompt}
         if 'actions' in data:
             actions=np.asarray(data['actions'],dtype=np.float32)
             if actions.ndim!=2 or actions.shape[-1]!=action_dim or not np.isfinite(actions).all():

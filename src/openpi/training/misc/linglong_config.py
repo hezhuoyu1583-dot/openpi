@@ -43,7 +43,8 @@ def encoding_metadata(state_eef, action_eef):
             'action_key':'action_eef' if action_eef else 'action',
             'state_encoding':'eef' if state_eef else 'joint',
             'layout':policy.EEF_LAYOUT if action_eef else policy.JOINT_LAYOUT,
-            'action_semantics':'absolute ee pose xyz + quaternion wxyz + gripper' if action_eef else 'absolute q_exp'}
+            'action_semantics':'absolute ee pose xyz + quaternion wxyz + gripper' if action_eef else 'absolute q_exp',
+            'control_mode':policy.EEF_CONTROL_MODE if action_eef else None}
 
 def sync_policy_metadata(config):
     """Record the launch-selected encodings. Omitted state encoding follows the action."""

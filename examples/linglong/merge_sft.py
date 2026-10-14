@@ -67,13 +67,29 @@ def check_images(table, episode_index):
                 raise FileNotFoundError(f"episode {episode_index} {camera} image is not an existing path reference: {item!r}")
 
 
+def joint_layout(manifest):
+    layout = manifest.get("layout")
+    if layout:
+        return layout
+    if manifest.get("original_columns_preserved"):
+        source_manifest = Path(manifest.get("source_dataset", "")) / "manifest.json"
+        if source_manifest.is_file():
+            return read_json(source_manifest).get("layout")
+    raise ValueError("joint layout is missing from the source manifest")
+
+
 def load_source(root):
     root = Path(root)
     info = read_json(root / "meta/info.json")
     manifest = read_json(root / "manifest.json")
     if info["fps"] != 15 or info["robot_type"] != "linglong_h":
         raise ValueError(f"{root} is not a 15 Hz linglong_h dataset")
-    if manifest.get("action_semantics") != "absolute q_exp":
+    semantics = manifest.get("action_semantics")
+    if semantics is None and manifest.get("original_columns_preserved"):
+        source_manifest = Path(manifest.get("source_dataset", "")) / "manifest.json"
+        if source_manifest.is_file():
+            semantics = read_json(source_manifest).get("action_semantics")
+    if semantics != "absolute q_exp":
         raise ValueError(f"{root} action semantics are not absolute q_exp")
     episodes = {row["episode_index"]: row for row in read_jsonl(root / "meta/episodes.jsonl")}
     mapping = {row["episode_index"]: row for row in read_json(root / "source_mapping.json")}
@@ -94,6 +110,7 @@ def merge(sources, output, check_image_files):
         raise FileExistsError(f"output already exists: {output}")
     loaded = [load_source(path) for path in sources]
     features = loaded[0]["info"]["features"]
+    expects_eef = "state_eef" in features and "action_eef" in features
     for source in loaded[1:]:
         if source["info"]["features"] != features:
             raise ValueError(f"feature schema differs: {source['root']}")
@@ -158,6 +175,8 @@ def merge(sources, output, check_image_files):
             })
             mapping.append(origin)
             stat_parts.append(np.concatenate([state, action], axis=1))
+            if expects_eef and not {"state_eef", "action_eef"} <= set(table.column_names):
+                raise ValueError(f"missing end-effector columns in {path}")
             if "state_eef" in table.column_names:
                 state_eef = np.asarray(table["state_eef"].to_pylist(), dtype=np.float64)
                 action_eef = np.asarray(table["action_eef"].to_pylist(), dtype=np.float64)
@@ -227,7 +246,7 @@ def merge(sources, output, check_image_files):
         })
     write_json(output / "manifest.json", {
         "status": "complete",
-        "layout": loaded[0]["manifest"]["layout"],
+        "layout": joint_layout(loaded[0]["manifest"]),
         "action_semantics": "absolute q_exp",
         "fps": 15,
         "sources": per_source,

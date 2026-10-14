@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
-from openpi.policies.linglong_policy import LinglongInputs, LinglongOutputs, PROMPT, resolve_encoding
+from openpi.policies.linglong_policy import (
+    EEF_CONTROL_MODE, LinglongInputs, LinglongOutputs, PROMPT, resolve_encoding, with_eef_control_mode)
 
 def images():
     return {f'observation.images.{k}':np.full((3,12,16),v,np.float32)
@@ -12,7 +13,7 @@ def sample(state_dim, action_dim):
 
 def test_eef_contract():
     x=LinglongInputs(state_eef=True, action_eef=True)(sample(16,16))
-    assert x['prompt']==PROMPT
+    assert x['prompt']==f'{EEF_CONTROL_MODE} {PROMPT}'
     np.testing.assert_array_equal(x['state'],np.arange(16))
     assert x['image']['left_wrist_0_rgb'].shape==(12,16,3)
     assert x['image']['left_wrist_0_rgb'][0,0,0]==128
@@ -21,15 +22,25 @@ def test_eef_contract():
 
 def test_joint_contract():
     x=LinglongInputs()(sample(24,24))
+    assert x['prompt']==PROMPT
+    assert EEF_CONTROL_MODE not in x['prompt']
     assert x['state'].shape==(24,)
     assert x['action_dim_mask'].tolist()==[True]*22+[False]*10
     assert x['actions'].shape==(50,24)
 
 def test_joint_state_with_eef_action():
     x=LinglongInputs(state_eef=False, action_eef=True)(sample(24,16))
+    assert x['prompt'].startswith(EEF_CONTROL_MODE)
     assert x['state'].shape==(24,)
     assert x['actions'].shape==(50,16)
     assert x['action_dim_mask'].sum()==16
+
+def test_control_mode_only_on_eef_actions():
+    joint_state=LinglongInputs(state_eef=True, action_eef=False)(sample(16,24))
+    assert joint_state['prompt']==PROMPT
+    tagged=LinglongInputs(action_eef=True)({**sample(24,16),'prompt':f'{EEF_CONTROL_MODE} {PROMPT}'})
+    assert tagged['prompt']==f'{EEF_CONTROL_MODE} {PROMPT}'
+    assert with_eef_control_mode(f'  {EEF_CONTROL_MODE} already')==f'{EEF_CONTROL_MODE} already'
 
 def test_encoding_flag():
     assert resolve_encoding(True) == (True, True)

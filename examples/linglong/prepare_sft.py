@@ -178,7 +178,7 @@ def quantile_stats(values):
         "q01": np.quantile(values, 0.01, axis=0), "q99": np.quantile(values, 0.99, axis=0),
     }.items()}
 
-def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_reference=None):
+def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_reference=None,split_note=None):
     if not 0 <= train_fraction <= 1: raise ValueError('train_fraction must be in [0,1]')
     output.mkdir(parents=True,exist_ok=resume)
     (output/'meta').mkdir(exist_ok=resume)
@@ -199,6 +199,10 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
     hf=datasets.Features({k:feature(v) for k,v in features.items()})
     parser,end_frames=load_eef_modules()
     episodes=[]; stats_rows=[]; mapping=[]; train=[]; val=[]; stats_arrays=[]; offset=0
+    task_list=[]
+    def task_id(text):
+        if text not in task_list: task_list.append(text)
+        return task_list.index(text)
     eef_state_parts=[]; eef_action_parts=[]; position_errors=[]; orientation_errors=[]
     rejected=0; short=0
     for rec in inventory:
@@ -230,13 +234,14 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         for start,end in bounds:
             if end-start<25: short+=int(end-start); continue
             selection=indices[start:end]; n=len(selection); ep=len(episodes)
+            text=rec.get('prompt') or prompt; tid=task_id(text)
             messages=[end_message(alignment[int(i)],poses) for i in selection]
             state_eef,action_eef,pos_mm,ang_deg=eef_for_rows(q[selection],a[selection],messages,end_frames)
             position_errors.append(pos_mm); orientation_errors.append(ang_deg)
             values={'observation.state':q[selection].tolist(),'action':a[selection].tolist(),
                     'state_eef':state_eef.astype(np.float32).tolist(),'action_eef':action_eef.astype(np.float32).tolist(),
                     'timestamp':(np.arange(n,dtype=np.float32)/15).tolist(),'frame_index':list(range(n)),
-                    'episode_index':[ep]*n,'index':list(range(offset,offset+n)),'task_index':[0]*n}
+                    'episode_index':[ep]*n,'index':list(range(offset,offset+n)),'task_index':[tid]*n}
             dest=output/f'data/chunk-{ep//1000:03d}/episode_{ep:06d}.parquet'; dest.parent.mkdir(parents=True,exist_ok=True)
             if not (resume and dest.exists()):
                 for cam in ('head','left','right'):
@@ -250,7 +255,7 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
                 same=saved.num_rows==n and np.array_equal(np.array(saved['action'].to_pylist()),a[selection]) and np.array_equal(np.array(saved['observation.state'].to_pylist()),q[selection])
                 same=same and np.allclose(np.array(saved['state_eef'].to_pylist()),state_eef,atol=1e-5) and np.allclose(np.array(saved['action_eef'].to_pylist()),action_eef,atol=1e-5)
                 if not same: raise ValueError('resume content mismatch: '+str(dest))
-            episodes.append({'episode_index':ep,'tasks':[prompt],'length':n})
+            episodes.append({'episode_index':ep,'tasks':[text],'length':n})
             sr={}
             for k,v in [('observation.state',q[selection]),('action',a[selection]),('state_eef',state_eef),('action_eef',action_eef)]:
                 sr[k]={name:arr.tolist() for name,arr in {'min':v.min(0),'max':v.max(0),'mean':v.mean(0),'std':v.std(0),'count':np.array([n])}.items()}
@@ -264,10 +269,11 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
                             'source_row_indices':selection.tolist(),'length':n})
             offset+=n
         print(f'{eid}: segments={len(episodes)} frames={offset}',flush=True)
-    for name,values in [('episodes',episodes),('episodes_stats',stats_rows),('tasks',[{'task_index':0,'task':prompt}])]:
+    for name,values in [('episodes',episodes),('episodes_stats',stats_rows),
+                        ('tasks',[{'task_index':i,'task':text} for i,text in enumerate(task_list)])]:
         (output/f'meta/{name}.jsonl').write_text(''.join(json.dumps(v,ensure_ascii=False)+'\n' for v in values))
     write(output/'meta/info.json',{'codebase_version':'v2.1','robot_type':'linglong_h',
-        'total_episodes':len(episodes),'total_frames':offset,'total_tasks':1,'total_videos':0,
+        'total_episodes':len(episodes),'total_frames':offset,'total_tasks':len(task_list),'total_videos':0,
         'total_chunks':(len(episodes)+999)//1000,'chunks_size':1000,'fps':15,
         'splits':{'train':f'0:{len(episodes)}'},'data_path':'data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet',
         'video_path':None,'features':features})
@@ -297,7 +303,8 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
                   'action_eef':quantile_stats(np.concatenate(eef_action_parts))}
     write(output/'assets/linglong_h/norm_stats.json',{'norm_stats':norm})
     write(output/'assets/linglong_h/eef_norm_stats.json',{'norm_stats':eef_norm})
-    write(output/'manifest.json',{'status':'complete','prompt':prompt,'layout':JOINT_LAYOUT,'eef_layout':EEF_LAYOUT,'source_root':str(source.resolve()),
+    write(output/'manifest.json',{'status':'complete','prompt':task_list[0] if len(task_list)==1 else task_list,
+        'layout':JOINT_LAYOUT,'eef_layout':EEF_LAYOUT,'source_root':str(source.resolve()),
         'source_inventory_sha256':hashlib.sha256((source/'inventory.json').read_bytes()).hexdigest(),
         'source_episodes':len(inventory),'segments':len(episodes),'train_segments':len(train),'validation_segments':len(val),
         'frames':offset,'train_stat_frames':stat_frames,'norm_reference':str(norm_reference) if norm_reference else None,'rejected_grid_rows':rejected,'discarded_short_segment_rows':short,
@@ -306,7 +313,7 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         'action_semantics':'absolute q_exp','state_eef':'logged /end_pos xyz and wrist orientation, gripper from measured joints 7 and 15',
         'action_eef':'end_frames(action) wrist_yaw_link pose plus wrist-frame TCP, gripper from commanded joints 7 and 15',
         'recorded_vs_end_frames':qa,'success_filter':'none; success labels unavailable',
-        'split':f'chronological source episodes train fraction {train_fraction}; train/validation JSON overrides meta full coverage'})
+        'split':split_note or f'chronological source episodes train fraction {train_fraction}; train/validation JSON overrides meta full coverage'})
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)

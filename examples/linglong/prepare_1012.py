@@ -16,7 +16,6 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, "/iag_ad_01/ad/zhengyuan/yyzj/linglong_rawdata_spec")
 import linglong_parser as parser
 from prepare_sft import prepare, write
 

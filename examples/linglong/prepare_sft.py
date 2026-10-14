@@ -8,21 +8,19 @@ orientation and the wrist-frame TCP point. Both are 16D xyz + quaternion wxyz
 import argparse
 import csv
 import hashlib
-import importlib.util
 import json
 import sqlite3
-import sys
 from pathlib import Path
 import numpy as np
 import datasets
+from end_frames import end_frames
+import linglong_parser as parser
 from openpi.policies.linglong_policy import PROMPT
 
 # Joint export layout. The training entry reads state_eef and action_eef.
 JOINT_LAYOUT = "left7,left_gripper,right7,right_gripper,waist4,head2,base2"
 EEF_LAYOUT = "left_xyz3_quat_wxyz4_gripper,right_xyz3_quat_wxyz4_gripper"
 EEF_DIM = 16
-PARSER = Path("/iag_ad_01/ad/zhengyuan/yyzj/linglong_rawdata_spec")
-END_FRAMES = Path("/iag_ad_01/ad/zhengyuan/yyzj/linglong-h-robot/tool/eval_stitch_error.py")
 MAX_END_AGE_NS = 80_000_000
 
 def write(path,value):
@@ -30,12 +28,7 @@ def write(path,value):
     path.write_text(json.dumps(value,ensure_ascii=False,indent=2,default=lambda x:x.item() if isinstance(x,np.generic) else str(x)))
 
 def load_eef_modules():
-    sys.path.insert(0, str(PARSER))
-    import linglong_parser as parser
-    spec = importlib.util.spec_from_file_location("linglong_end_frames", END_FRAMES)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return parser, module.end_frames
+    return parser, end_frames
 
 def bag_path(source, record):
     episode = record["episode"]
@@ -197,7 +190,7 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
             return datasets.Sequence(datasets.Value('float32'),length=spec['shape'][0])
         return datasets.Value(spec['dtype'])
     hf=datasets.Features({k:feature(v) for k,v in features.items()})
-    parser,end_frames=load_eef_modules()
+    parser,kinematics=load_eef_modules()
     episodes=[]; stats_rows=[]; mapping=[]; train=[]; val=[]; stats_arrays=[]; offset=0
     task_list=[]
     def task_id(text):
@@ -236,7 +229,7 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
             selection=indices[start:end]; n=len(selection); ep=len(episodes)
             text=rec.get('prompt') or prompt; tid=task_id(text)
             messages=[end_message(alignment[int(i)],poses) for i in selection]
-            state_eef,action_eef,pos_mm,ang_deg=eef_for_rows(q[selection],a[selection],messages,end_frames)
+            state_eef,action_eef,pos_mm,ang_deg=eef_for_rows(q[selection],a[selection],messages,kinematics)
             position_errors.append(pos_mm); orientation_errors.append(ang_deg)
             values={'observation.state':q[selection].tolist(),'action':a[selection].tolist(),
                     'state_eef':state_eef.astype(np.float32).tolist(),'action_eef':action_eef.astype(np.float32).tolist(),

@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 WORK = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(WORK / 'linglong_rawdata_spec'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import linglong_parser as parser
 from prepare_sft import prepare, write
 

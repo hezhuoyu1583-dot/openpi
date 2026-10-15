@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from quantile_outliers import filter_dataset
 
 DEFAULT_SOURCES = [
     Path("/iag_ad_01/ad/dushuyue/openpi/data/linglong_0923_sft_train_15hz"),
@@ -120,7 +121,6 @@ def merge(sources, output, check_image_files):
     mapping = []
     tasks = []
     stat_parts = []
-    eef_parts = []
     offset = 0
     for source in loaded:
         for origin_episode in source["selected"]:
@@ -192,21 +192,11 @@ def merge(sources, output, check_image_files):
                         "std": values.std(0).tolist(),
                         "count": [length],
                     }
-                eef_parts.append(np.concatenate([state_eef, action_eef], axis=1))
             offset += length
             print(f"{source['root'].name} episode {origin_episode} -> {episode_index} frames={offset}", flush=True)
 
     if not stat_parts:
         raise ValueError("no training frames")
-    combined = np.concatenate(stat_parts).astype(np.float64)
-    norm = {}
-    for key, values in (("state", combined[:, :24]), ("actions", combined[:, 24:])):
-        norm[key] = {
-            "mean": values.mean(0).tolist(),
-            "std": values.std(0).tolist(),
-            "q01": np.quantile(values, 0.01, axis=0).tolist(),
-            "q99": np.quantile(values, 0.99, axis=0).tolist(),
-        }
     info = dict(loaded[0]["info"])
     info.update({
         "total_episodes": len(episodes),
@@ -223,17 +213,25 @@ def merge(sources, output, check_image_files):
     write_json(output / "train_episodes.json", list(range(len(episodes))))
     write_json(output / "validation_episodes.json", [])
     write_json(output / "source_mapping.json", mapping)
+    outlier_report = filter_dataset(output, list(range(len(episodes))))
+    columns = outlier_report["train_columns"]
+
+    def quantile_stats(values):
+        values = np.asarray(values, dtype=np.float64)
+        return {
+            "mean": values.mean(0).tolist(),
+            "std": values.std(0).tolist(),
+            "q01": np.quantile(values, 0.01, axis=0).tolist(),
+            "q99": np.quantile(values, 0.99, axis=0).tolist(),
+        }
+
+    norm = {"state": quantile_stats(columns["observation.state"]), "actions": quantile_stats(columns["action"])}
     write_json(output / "assets/linglong_h/norm_stats.json", {"norm_stats": norm})
-    if eef_parts:
-        eef = np.concatenate(eef_parts).astype(np.float64)
-        eef_norm = {}
-        for key, values in (("state_eef", eef[:, :16]), ("action_eef", eef[:, 16:])):
-            eef_norm[key] = {
-                "mean": values.mean(0).tolist(),
-                "std": values.std(0).tolist(),
-                "q01": np.quantile(values, 0.01, axis=0).tolist(),
-                "q99": np.quantile(values, 0.99, axis=0).tolist(),
-            }
+    if "state_eef" in columns:
+        eef_norm = {
+            "state_eef": quantile_stats(columns["state_eef"]),
+            "action_eef": quantile_stats(columns["action_eef"]),
+        }
         write_json(output / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": eef_norm})
     per_source = []
     for source in loaded:
@@ -254,14 +252,15 @@ def merge(sources, output, check_image_files):
         "segments": len(episodes),
         "train_segments": len(episodes),
         "validation_segments": 0,
-        "frames": offset,
-        "train_stat_frames": int(combined.shape[0]),
+        "frames": outlier_report["frames"],
+        "train_stat_frames": int(len(columns["action"])),
+        "quantile_outliers": {key: value for key, value in outlier_report.items() if key != "train_columns"},
         "image_storage": "absolute original JPEG references; sources must remain accessible",
-        "norm": "q01/q99 recomputed on the concatenated training frames",
+        "norm": "q01/q99 recomputed on the concatenated training frames after obvious quantile outliers are removed",
         "holdout": "source validation and test directories were not inputs",
         "order": "sources are concatenated in CLI order; episode ids restart at 0",
     })
-    print(f"COMPLETE episodes={len(episodes)} frames={offset} tasks={len(tasks)}", flush=True)
+    print(f"COMPLETE episodes={len(episodes)} frames={outlier_report['frames']} tasks={len(tasks)}", flush=True)
 
 
 def main():

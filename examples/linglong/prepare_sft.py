@@ -16,6 +16,7 @@ import datasets
 from end_frames import end_frames
 import linglong_parser as parser
 from openpi.policies.linglong_policy import PROMPT
+from quantile_outliers import filter_dataset
 
 # Joint export layout. The training entry reads state_eef and action_eef.
 JOINT_LAYOUT = "left7,left_gripper,right7,right_gripper,waist4,head2,base2"
@@ -164,6 +165,22 @@ def eef_for_rows(state, action, messages, end_frames):
     orientation_deg = geodesic_deg(recorded_rot, state_rotations)
     return state_eef, action_eef, position_mm, orientation_deg
 
+def _saved_rows_match(saved_rows, source_rows):
+    """Resume accepts the original rows or the ordered subset left by the outlier filter."""
+    saved_action=np.asarray(saved_rows['action'],dtype=np.float64)
+    source_action=np.asarray(source_rows['action'],dtype=np.float64)
+    if len(saved_action)>len(source_action): return False
+    chosen=[]; cursor=0
+    for row in saved_action:
+        while cursor<len(source_action) and not np.allclose(source_action[cursor],row,atol=1e-5,rtol=0):
+            cursor+=1
+        if cursor==len(source_action): return False
+        chosen.append(cursor); cursor+=1
+    for key,source in source_rows.items():
+        if not np.allclose(np.asarray(saved_rows[key],dtype=np.float64),np.asarray(source,dtype=np.float64)[chosen],atol=1e-5,rtol=0):
+            return False
+    return True
+
 def quantile_stats(values):
     values = np.asarray(values, dtype=np.float64)
     return {name: arr.tolist() for name, arr in {
@@ -191,12 +208,12 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         return datasets.Value(spec['dtype'])
     hf=datasets.Features({k:feature(v) for k,v in features.items()})
     parser,kinematics=load_eef_modules()
-    episodes=[]; stats_rows=[]; mapping=[]; train=[]; val=[]; stats_arrays=[]; offset=0
+    episodes=[]; stats_rows=[]; mapping=[]; train=[]; val=[]; offset=0
     task_list=[]
     def task_id(text):
         if text not in task_list: task_list.append(text)
         return task_list.index(text)
-    eef_state_parts=[]; eef_action_parts=[]; position_errors=[]; orientation_errors=[]
+    position_errors=[]; orientation_errors=[]
     rejected=0; short=0
     for rec in inventory:
         eid=rec['episode']; path=source/'decoded'/eid
@@ -245,18 +262,15 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
             else:
                 import pyarrow.parquet as pq
                 saved=pq.read_table(dest,columns=['observation.state','action','state_eef','action_eef'])
-                same=saved.num_rows==n and np.array_equal(np.array(saved['action'].to_pylist()),a[selection]) and np.array_equal(np.array(saved['observation.state'].to_pylist()),q[selection])
-                same=same and np.allclose(np.array(saved['state_eef'].to_pylist()),state_eef,atol=1e-5) and np.allclose(np.array(saved['action_eef'].to_pylist()),action_eef,atol=1e-5)
-                if not same: raise ValueError('resume content mismatch: '+str(dest))
+                source_rows={'observation.state':q[selection],'action':a[selection],'state_eef':state_eef,'action_eef':action_eef}
+                saved_rows={key:np.asarray(saved.column(key).to_pylist(),dtype=np.float64) for key in source_rows}
+                if not _saved_rows_match(saved_rows, source_rows): raise ValueError('resume content mismatch: '+str(dest))
             episodes.append({'episode_index':ep,'tasks':[text],'length':n})
             sr={}
             for k,v in [('observation.state',q[selection]),('action',a[selection]),('state_eef',state_eef),('action_eef',action_eef)]:
                 sr[k]={name:arr.tolist() for name,arr in {'min':v.min(0),'max':v.max(0),'mean':v.mean(0),'std':v.std(0),'count':np.array([n])}.items()}
             stats_rows.append({'episode_index':ep,'stats':sr})
             is_train=eid in train_sources; (train if is_train else val).append(ep)
-            if is_train:
-                stats_arrays.append(np.concatenate([q[selection],a[selection]],axis=1))
-                eef_state_parts.append(state_eef); eef_action_parts.append(action_eef)
             mapping.append({'episode_index':ep,'source_id':eid,'archive_member':rec['archive_member'],
                             'split':'train' if is_train else 'validation','grid_start_ns':int(grid[start]),
                             'source_row_indices':selection.tolist(),'length':n})
@@ -272,6 +286,15 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         'video_path':None,'features':features})
     write(output/'train_episodes.json',train); write(output/'validation_episodes.json',val)
     write(output/'source_mapping.json',mapping)
+    reference_stats=None
+    if norm_reference is not None:
+        reference=Path(norm_reference)
+        copied=json.loads(reference.read_text())['norm_stats']
+        eef_reference=reference.parent/'eef_norm_stats.json'
+        if not eef_reference.is_file(): raise ValueError(f'missing {eef_reference}')
+        copied_eef=json.loads(eef_reference.read_text())['norm_stats']
+        reference_stats={**copied,**copied_eef}
+    outlier_report=filter_dataset(output, train, reference_stats=reference_stats)
     norm={}; eef_norm={}; stat_frames=0; qa={}
     if position_errors:
         position_errors=np.concatenate(position_errors); orientation_errors=np.concatenate(orientation_errors)
@@ -282,25 +305,21 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         qa={'left_position_mm':float(np.median(position_errors[:,0])),'right_position_mm':float(np.median(position_errors[:,1])),
             'left_orientation_deg':float(np.median(orientation_errors[:,0])),'right_orientation_deg':float(np.median(orientation_errors[:,1]))}
     if norm_reference is not None:
-        reference=Path(norm_reference)
-        norm=json.loads(reference.read_text())['norm_stats']
-        eef_reference=reference.parent/'eef_norm_stats.json'
-        if not eef_reference.is_file(): raise ValueError(f'missing {eef_reference}')
-        eef_norm=json.loads(eef_reference.read_text())['norm_stats']
+        norm=copied; eef_norm=copied_eef
     else:
-        if not stats_arrays: raise ValueError('No training frames for normalization')
-        x=np.concatenate(stats_arrays).astype(np.float64); stat_frames=len(x)
-        for key,v in [('state',x[:,:24]),('actions',x[:,24:])]:
-            norm[key]=quantile_stats(v)
-        eef_norm={'state_eef':quantile_stats(np.concatenate(eef_state_parts)),
-                  'action_eef':quantile_stats(np.concatenate(eef_action_parts))}
+        columns=outlier_report['train_columns']
+        if len(columns['action'])==0: raise ValueError('No training frames for normalization')
+        stat_frames=len(columns['action'])
+        norm={'state':quantile_stats(columns['observation.state']),'actions':quantile_stats(columns['action'])}
+        eef_norm={'state_eef':quantile_stats(columns['state_eef']),'action_eef':quantile_stats(columns['action_eef'])}
     write(output/'assets/linglong_h/norm_stats.json',{'norm_stats':norm})
     write(output/'assets/linglong_h/eef_norm_stats.json',{'norm_stats':eef_norm})
     write(output/'manifest.json',{'status':'complete','prompt':task_list[0] if len(task_list)==1 else task_list,
         'layout':JOINT_LAYOUT,'eef_layout':EEF_LAYOUT,'source_root':str(source.resolve()),
         'source_inventory_sha256':hashlib.sha256((source/'inventory.json').read_bytes()).hexdigest(),
         'source_episodes':len(inventory),'segments':len(episodes),'train_segments':len(train),'validation_segments':len(val),
-        'frames':offset,'train_stat_frames':stat_frames,'norm_reference':str(norm_reference) if norm_reference else None,'rejected_grid_rows':rejected,'discarded_short_segment_rows':short,
+        'frames':outlier_report['frames'],'train_stat_frames':stat_frames,'norm_reference':str(norm_reference) if norm_reference else None,'rejected_grid_rows':rejected,'discarded_short_segment_rows':short,
+        'quantile_outliers':{k:v for k,v in outlier_report.items() if k!='train_columns'},
         'resampling':'15Hz nearest head <=20ms; all streams absolute age <=80ms; reject whole source if any invalid grid row, original head gap >50ms or original aligned age >80ms',
         'image_storage':'absolute original JPEG references; source must remain accessible',
         'action_semantics':'absolute q_exp','state_eef':'logged /end_pos xyz and wrist orientation, gripper from measured joints 7 and 15',

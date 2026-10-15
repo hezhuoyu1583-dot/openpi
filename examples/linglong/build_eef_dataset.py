@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from prepare_sft import eef_for_rows, end_message, load_eef_modules, load_end_poses
+from quantile_outliers import filter_dataset
 
 SOURCE = Path("/iag_ad_01/ad/dushuyue/openpi/data/linglong_0923_1010_sft_train_15hz")
 OUTPUT = Path("/iag_ad_01/ad/dushuyue/openpi/data/linglong_0923_1010_eef_sft_train_15hz")
@@ -72,8 +73,6 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
     partial = output.with_name(output.name + ".partial")
     if partial.exists():
         shutil.rmtree(partial)
-    state_parts = []
-    action_parts = []
     position_errors = []
     orientation_errors = []
     for record in mapping:
@@ -98,8 +97,6 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
         dest.parent.mkdir(parents=True, exist_ok=True)
         written = table.append_column("state_eef", fixed_list(state_eef)).append_column("action_eef", fixed_list(action_eef))
         pq.write_table(written, dest)
-        state_parts.append(state_eef)
-        action_parts.append(action_eef)
         if stats_rows[episode]["episode_index"] != episode:
             raise ValueError(f"episodes_stats out of order at episode {episode}")
         stats_rows[episode]["stats"]["state_eef"] = episode_stat(state_eef)
@@ -112,15 +109,6 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
         raise ValueError("recorded end position disagrees with end_frames by more than 10 mm median")
     if np.median(orientation_errors) > 5.0:
         raise ValueError("recorded end orientation disagrees with wrist_yaw end_frames by more than 5 deg median")
-    combined = {"state_eef": np.concatenate(state_parts), "action_eef": np.concatenate(action_parts)}
-    stats = {}
-    for key, values in combined.items():
-        stats[key] = {
-            "mean": values.mean(0).tolist(),
-            "std": values.std(0).tolist(),
-            "q01": np.quantile(values, 0.01, axis=0).tolist(),
-            "q99": np.quantile(values, 0.99, axis=0).tolist(),
-        }
     meta = partial / "meta"
     meta.mkdir(parents=True, exist_ok=True)
     for name in ("episodes.jsonl", "tasks.jsonl"):
@@ -134,7 +122,27 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
     info["features"]["state_eef"] = feature
     info["features"]["action_eef"] = dict(feature)
     write_json(partial / "meta/info.json", info)
-    write_json(partial / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": stats})
+    train_ids = json.loads((partial / "train_episodes.json").read_text()) if (partial / "train_episodes.json").is_file() else list(range(len(mapping)))
+    outlier_report = filter_dataset(partial, train_ids)
+    columns = outlier_report["train_columns"]
+
+    def quantile_stats(values):
+        values = np.asarray(values, dtype=np.float64)
+        return {
+            "mean": values.mean(0).tolist(),
+            "std": values.std(0).tolist(),
+            "q01": np.quantile(values, 0.01, axis=0).tolist(),
+            "q99": np.quantile(values, 0.99, axis=0).tolist(),
+        }
+
+    write_json(partial / "assets/linglong_h/norm_stats.json", {"norm_stats": {
+        "state": quantile_stats(columns["observation.state"]),
+        "actions": quantile_stats(columns["action"]),
+    }})
+    write_json(partial / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": {
+        "state_eef": quantile_stats(columns["state_eef"]),
+        "action_eef": quantile_stats(columns["action_eef"]),
+    }})
     write_json(partial / "manifest.json", {
         "status": "complete",
         "source_dataset": str(source),
@@ -154,7 +162,8 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
             "gripper": "action indices 7 and 15",
         },
         "quaternion_sign": "continuous independently per hand within each episode",
-        "frames": int(combined["state_eef"].shape[0]),
+        "frames": outlier_report["frames"],
+        "quantile_outliers": {key: value for key, value in outlier_report.items() if key != "train_columns"},
         "recorded_vs_end_frames_on_state_mm": {
             "left_median": float(np.median(position_errors[:, 0])),
             "right_median": float(np.median(position_errors[:, 1])),

@@ -35,7 +35,7 @@ def keep_mask(columns, train_rows, *, limit=OUTLIER_NORM_LIMIT, max_rounds=MAX_R
         if not np.isfinite(values).all():
             raise ValueError(f"{name} has non-finite values")
     train_rows = np.asarray(train_rows, dtype=bool)
-    if int(train_rows.sum()) < 2:
+    if reference is None and int(train_rows.sum()) < 2:
         raise ValueError("need at least two training frames to fit quantiles")
     keep = np.ones(count, dtype=bool)
     examples = []

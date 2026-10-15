@@ -112,6 +112,8 @@ def main():
     write(TEST_OUT/'meta/info.json',info)
     write(ROOT/'completion.json',dict(status='complete',train_sources=len(train),test_sources=len(test),
         duplicates_excluded=len(excluded),prompt=PROMPT,seconds=time.monotonic()-started))
+    from dataset_catalog import update_catalog
+    update_catalog(TEST_OUT)
     print('COMPLETE',flush=True)
 
 if __name__=='__main__': main()

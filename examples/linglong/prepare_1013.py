@@ -181,6 +181,8 @@ def main():
     info = json.loads((TEST_OUT / "meta/info.json").read_text())
     info["splits"] = {"test": f"0:{info['total_episodes']}"}
     write(TEST_OUT / "meta/info.json", info)
+    from dataset_catalog import update_catalog
+    update_catalog(TEST_OUT)
     print("COMPLETE", {"test": sorted(test_ids), "seconds": round(time.monotonic() - started, 1)}, flush=True)
 
 if __name__ == "__main__":

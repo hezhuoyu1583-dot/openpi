@@ -79,7 +79,7 @@ def joint_layout(manifest):
     raise ValueError("joint layout is missing from the source manifest")
 
 
-def load_source(root):
+def load_source(root, selection="train_episodes.json"):
     root = Path(root)
     info = read_json(root / "meta/info.json")
     manifest = read_json(root / "manifest.json")
@@ -94,9 +94,9 @@ def load_source(root):
         raise ValueError(f"{root} action semantics are not absolute q_exp")
     episodes = {row["episode_index"]: row for row in read_jsonl(root / "meta/episodes.jsonl")}
     mapping = {row["episode_index"]: row for row in read_json(root / "source_mapping.json")}
-    selected = read_json(root / "train_episodes.json")
+    selected = read_json(root / selection)
     if not selected:
-        raise ValueError(f"{root} has no training episodes")
+        raise ValueError(f"{root} {selection} has no episodes")
     if len(set(selected)) != len(selected):
         raise ValueError(f"{root} train_episodes.json has duplicate ids")
     missing = [episode for episode in selected if episode not in episodes or episode not in mapping]
@@ -105,11 +105,27 @@ def load_source(root):
     return {"root": root, "info": info, "manifest": manifest, "episodes": episodes, "mapping": mapping, "selected": selected}
 
 
-def merge(sources, output, check_image_files):
+def merge(sources, output, check_image_files, *, role="train", norm_reference=None):
     output = Path(output)
     if output.exists():
         raise FileExistsError(f"output already exists: {output}")
-    loaded = [load_source(path) for path in sources]
+    if role not in {"train", "test"}:
+        raise ValueError(f"unknown role {role}")
+    selection = "train_episodes.json" if role == "train" else "test_episodes.json"
+    if role == "test":
+        if norm_reference is None:
+            raise ValueError("a test merge needs the training set norm_stats.json")
+        for path in sources:
+            if not (Path(path) / selection).is_file():
+                selection = "validation_episodes.json"
+                break
+        reference = Path(norm_reference)
+        copied = read_json(reference)["norm_stats"]
+        eef_reference = reference.parent / "eef_norm_stats.json"
+        if not eef_reference.is_file():
+            raise ValueError(f"missing {eef_reference}")
+        copied_eef = read_json(eef_reference)["norm_stats"]
+    loaded = [load_source(path, selection) for path in sources]
     features = loaded[0]["info"]["features"]
     expects_eef = "state_eef" in features and "action_eef" in features
     for source in loaded[1:]:
@@ -171,7 +187,7 @@ def merge(sources, output, check_image_files):
                 "origin_name": source["root"].name,
                 "task_index": task_index,
                 "task": prompt,
-                "split": "train",
+                "split": "train" if role == "train" else "validation",
             })
             mapping.append(origin)
             stat_parts.append(np.concatenate([state, action], axis=1))
@@ -204,16 +220,22 @@ def merge(sources, output, check_image_files):
         "total_tasks": len(tasks),
         "total_videos": 0,
         "total_chunks": (len(episodes) + 999) // 1000,
-        "splits": {"train": f"0:{len(episodes)}"},
+        "splits": {"train": f"0:{len(episodes)}"} if role == "train" else {"test": f"0:{len(episodes)}"},
     })
     write_jsonl(output / "meta/episodes.jsonl", episodes)
     write_jsonl(output / "meta/episodes_stats.jsonl", stats_rows)
     write_jsonl(output / "meta/tasks.jsonl", [{"task_index": index, "task": prompt} for index, prompt in enumerate(tasks)])
     write_json(output / "meta/info.json", info)
-    write_json(output / "train_episodes.json", list(range(len(episodes))))
-    write_json(output / "validation_episodes.json", [])
+    episode_ids = list(range(len(episodes)))
+    write_json(output / "train_episodes.json", episode_ids if role == "train" else [])
+    write_json(output / "validation_episodes.json", [] if role == "train" else episode_ids)
+    if role == "test":
+        write_json(output / "test_episodes.json", episode_ids)
     write_json(output / "source_mapping.json", mapping)
-    outlier_report = filter_dataset(output, list(range(len(episodes))))
+    if role == "train":
+        outlier_report = filter_dataset(output, episode_ids)
+    else:
+        outlier_report = filter_dataset(output, [], reference_stats={**copied, **copied_eef})
     columns = outlier_report["train_columns"]
 
     def quantile_stats(values):
@@ -225,14 +247,18 @@ def merge(sources, output, check_image_files):
             "q99": np.quantile(values, 0.99, axis=0).tolist(),
         }
 
-    norm = {"state": quantile_stats(columns["observation.state"]), "actions": quantile_stats(columns["action"])}
-    write_json(output / "assets/linglong_h/norm_stats.json", {"norm_stats": norm})
-    if "state_eef" in columns:
-        eef_norm = {
-            "state_eef": quantile_stats(columns["state_eef"]),
-            "action_eef": quantile_stats(columns["action_eef"]),
-        }
-        write_json(output / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": eef_norm})
+    if role == "train":
+        norm = {"state": quantile_stats(columns["observation.state"]), "actions": quantile_stats(columns["action"])}
+        write_json(output / "assets/linglong_h/norm_stats.json", {"norm_stats": norm})
+        if "state_eef" in columns:
+            eef_norm = {
+                "state_eef": quantile_stats(columns["state_eef"]),
+                "action_eef": quantile_stats(columns["action_eef"]),
+            }
+            write_json(output / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": eef_norm})
+    else:
+        write_json(output / "assets/linglong_h/norm_stats.json", {"norm_stats": copied})
+        write_json(output / "assets/linglong_h/eef_norm_stats.json", {"norm_stats": copied_eef})
     per_source = []
     for source in loaded:
         per_source.append({
@@ -250,16 +276,19 @@ def merge(sources, output, check_image_files):
         "sources": per_source,
         "tasks": tasks,
         "segments": len(episodes),
-        "train_segments": len(episodes),
-        "validation_segments": 0,
+        "train_segments": len(episodes) if role == "train" else 0,
+        "validation_segments": 0 if role == "train" else len(episodes),
         "frames": outlier_report["frames"],
-        "train_stat_frames": int(len(columns["action"])),
+        "train_stat_frames": int(len(columns["action"])) if role == "train" else 0,
         "quantile_outliers": {key: value for key, value in outlier_report.items() if key != "train_columns"},
         "image_storage": "absolute original JPEG references; sources must remain accessible",
-        "norm": "q01/q99 recomputed on the concatenated training frames after obvious quantile outliers are removed",
-        "holdout": "source validation and test directories were not inputs",
+        "norm": "q01/q99 recomputed on the concatenated training frames after obvious quantile outliers are removed" if role == "train" else "copied from the merged training set",
+        "norm_reference": None if role == "train" else str(norm_reference),
+        "holdout": "source validation and test directories were not inputs" if role == "train" else "merged from the source test episodes",
         "order": "sources are concatenated in CLI order; episode ids restart at 0",
     })
+    from dataset_catalog import update_catalog
+    update_catalog(output)
     print(f"COMPLETE episodes={len(episodes)} frames={outlier_report['frames']} tasks={len(tasks)}", flush=True)
 
 
@@ -268,10 +297,12 @@ def main():
     parser.add_argument("--sources", type=Path, nargs="+", default=DEFAULT_SOURCES)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--skip-image-check", action="store_true", help="Do not stat every referenced JPEG")
+    parser.add_argument("--role", choices=("train", "test"), default="train")
+    parser.add_argument("--norm-reference", type=Path, help="Training norm_stats.json copied into a test merge")
     args = parser.parse_args()
     if len(args.sources) < 2:
         raise SystemExit("pass at least two source datasets")
-    merge(args.sources, args.output, check_image_files=not args.skip_image_check)
+    merge(args.sources, args.output, check_image_files=not args.skip_image_check, role=args.role, norm_reference=args.norm_reference)
 
 
 if __name__ == "__main__":

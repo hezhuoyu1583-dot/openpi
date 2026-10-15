@@ -176,6 +176,8 @@ def build(source=SOURCE, output=OUTPUT, decoded_root=None):
         },
     })
     partial.rename(output)
+    from dataset_catalog import update_catalog
+    update_catalog(output)
     print(f"COMPLETE {output}", flush=True)
 
 

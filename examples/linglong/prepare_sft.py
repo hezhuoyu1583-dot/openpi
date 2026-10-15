@@ -326,6 +326,8 @@ def prepare(source,output,resume=False,*,prompt=PROMPT,train_fraction=.8,norm_re
         'action_eef':'end_frames(action) wrist_yaw_link pose plus wrist-frame TCP, gripper from commanded joints 7 and 15',
         'recorded_vs_end_frames':qa,'success_filter':'none; success labels unavailable',
         'split':split_note or f'chronological source episodes train fraction {train_fraction}; train/validation JSON overrides meta full coverage'})
+    from dataset_catalog import update_catalog
+    update_catalog(output)
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)

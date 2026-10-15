@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 from openpi.policies.linglong_policy import (
-    EEF_CONTROL_MODE, LinglongInputs, LinglongOutputs, PROMPT, resolve_encoding, with_eef_control_mode)
+    EEF_CONTROL_MODE, LinglongAbsoluteActions, LinglongInputs, LinglongOutputs, LinglongRelativeActions,
+    PROMPT, joint_relative_mask, pose_to_absolute, pose_to_relative, resolve_encoding, with_eef_control_mode)
 
 def images():
     return {f'observation.images.{k}':np.full((3,12,16),v,np.float32)
@@ -55,6 +56,50 @@ def test_invalid_values():
         s=sample(16,16); s[key].flat[0]=np.nan
         with pytest.raises(ValueError): transform(s)
     with pytest.raises(ValueError): LinglongInputs()(sample(16,16))
+
+def test_joint_relative_roundtrip_keeps_gripper_and_base():
+    mask = joint_relative_mask()
+    assert mask.tolist() == [True]*7+[False]+[True]*7+[False]+[True]*6+[False]*2
+    state = np.linspace(0.1, 2.4, 24)
+    actions = np.stack([state, state+0.05])
+    actions[:, 7] = [0.2, 0.8]
+    actions[:, 15] = [0.3, 0.1]
+    actions[:, 22:] = [[1, 2], [3, 4]]
+    relative = pose_to_relative(state, actions, action_eef=False)
+    np.testing.assert_allclose(relative[:, :7], actions[:, :7]-state[:7])
+    np.testing.assert_allclose(relative[:, 7], actions[:, 7])
+    np.testing.assert_allclose(relative[:, 15], actions[:, 15])
+    np.testing.assert_allclose(relative[:, 22:], actions[:, 22:])
+    restored = LinglongAbsoluteActions()({'state': state, 'actions': relative})['actions']
+    np.testing.assert_allclose(restored, actions, atol=1e-6)
+    untouched = LinglongRelativeActions()({'state': state})
+    assert 'actions' not in untouched
+
+def test_eef_relative_pose_roundtrip():
+    state = np.zeros(16)
+    state[0:3] = [0.30, 0.25, 0.65]
+    state[3:7] = [1, 0, 0, 0]
+    state[7] = 0.25
+    yaw = np.pi/3
+    state[8:11] = [0.40, -0.10, 0.55]
+    state[11:15] = [np.cos(yaw/2), 0, 0, np.sin(yaw/2)]
+    state[15] = 0.75
+    actions = np.repeat(state[None], 2, axis=0)
+    actions[1, 0:3] += [0.02, -0.01, 0.03]
+    actions[1, 7] = 0
+    actions[1, 15] = 1
+    relative = LinglongRelativeActions(action_eef=True)({'state': state, 'actions': actions})['actions']
+    np.testing.assert_allclose(relative[:, 7], actions[:, 7])
+    np.testing.assert_allclose(relative[:, 15], actions[:, 15])
+    np.testing.assert_allclose(relative[0, 0:3], 0, atol=1e-6)
+    np.testing.assert_allclose(relative[0, 3:7], [1, 0, 0, 0], atol=1e-6)
+    restored = pose_to_absolute(state, relative, action_eef=True)
+    np.testing.assert_allclose(restored[:, :3], actions[:, :3], atol=1e-6)
+    np.testing.assert_allclose(restored[:, 8:11], actions[:, 8:11], atol=1e-6)
+    np.testing.assert_allclose(restored[:, [7, 15]], actions[:, [7, 15]])
+    for row in range(2):
+        for sl in (slice(3, 7), slice(11, 15)):
+            assert abs(np.dot(restored[row, sl], actions[row, sl])) > 1-1e-6
 
 def test_outputs_preserve_values():
     x=np.arange(1600).reshape(50,32)

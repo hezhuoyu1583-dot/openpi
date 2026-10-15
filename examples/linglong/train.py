@@ -54,9 +54,10 @@ if __name__=='__main__':
         file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         handlers=[file_handler,MetricsHandler(log_dir)]
         for handler in handlers:logging.getLogger().addHandler(handler)
-        logging.info('Linglong run start: resume=%s config=%s dataset=%s state=%s action=%s metrics_run_id=%s',
+        logging.info('Linglong run start: resume=%s config=%s dataset=%s state=%s action=%s relative_actions=%s metrics_run_id=%s',
                      config.resume,config.name,config.policy_metadata.get('dataset_root'),
-                     config.policy_metadata.get('state_key'),config.policy_metadata.get('action_key'),handlers[1].run_id)
+                     config.policy_metadata.get('state_key'),config.policy_metadata.get('action_key'),
+                     config.policy_metadata.get('relative_actions'),handlers[1].run_id)
     try:
         module.train_loop(config)
     except BaseException:

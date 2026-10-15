@@ -1,9 +1,12 @@
 """Isolated Linglong SFT registration; existing robot configs are untouched."""
 import dataclasses
 import json
+import logging
 from pathlib import Path
 from typing import Literal
 import numpy as np
+import pyarrow.parquet as pq
+import tyro
 from openpi.policies import linglong_policy as policy
 from openpi.shared.normalize import NormStats
 from openpi import transforms
@@ -38,12 +41,16 @@ def select_norm_stats(root, joint_stats, state_eef, action_eef):
     return {'state':(eef_stats if state_eef else joint_stats)['state'],
             'actions':(eef_stats if action_eef else joint_stats)['actions']}
 
-def encoding_metadata(state_eef, action_eef):
+def encoding_metadata(state_eef, action_eef, relative_actions=False):
+    absolute = 'absolute ee pose xyz + quaternion wxyz + gripper' if action_eef else 'absolute q_exp'
     return {'state_key':'state_eef' if state_eef else 'observation.state',
             'action_key':'action_eef' if action_eef else 'action',
             'state_encoding':'eef' if state_eef else 'joint',
             'layout':policy.EEF_LAYOUT if action_eef else policy.JOINT_LAYOUT,
-            'action_semantics':'absolute ee pose xyz + quaternion wxyz + gripper' if action_eef else 'absolute q_exp',
+            'action_semantics':absolute,
+            'relative_actions':bool(relative_actions),
+            'model_action_semantics':('relative to the input state; grippers stay absolute'
+                                      if relative_actions else absolute),
             'control_mode':policy.EEF_CONTROL_MODE if action_eef else None}
 
 def sync_policy_metadata(config):
@@ -51,8 +58,37 @@ def sync_policy_metadata(config):
     data=config.data
     if not hasattr(data,'eef'): return config
     state_eef,action_eef=policy.resolve_encoding(data.eef, data.state_encoding)
-    return dataclasses.replace(config, policy_metadata={**config.policy_metadata, **encoding_metadata(state_eef, action_eef),
+    return dataclasses.replace(config, policy_metadata={**config.policy_metadata, **encoding_metadata(state_eef, action_eef, getattr(data,'relative_actions',False)),
         'dataset_root':str(Path(data.dataset_root))})
+
+def _quantile_stats(values):
+    values=np.asarray(values, dtype=np.float64)
+    return NormStats(mean=values.mean(0), std=values.std(0),
+                     q01=np.quantile(values, 0.01, axis=0), q99=np.quantile(values, 0.99, axis=0))
+
+def relative_action_norm_stats(root, episode_indices, action_eef, horizon):
+    """Quantile stats of the relative training target, including LeRobot's end-of-episode repeat."""
+    if horizon < 1: raise ValueError('action horizon must be positive')
+    state_key='state_eef' if action_eef else 'observation.state'
+    action_key='action_eef' if action_eef else 'action'
+    width=policy.EEF_DIM if action_eef else policy.JOINT_DIM
+    chunks=[]
+    for episode in episode_indices:
+        path=Path(root)/f'data/chunk-{episode//1000:03d}/episode_{episode:06d}.parquet'
+        table=pq.read_table(path, columns=[state_key, action_key])
+        state=np.asarray(table.column(state_key).to_pylist(), dtype=np.float64)
+        action=np.asarray(table.column(action_key).to_pylist(), dtype=np.float64)
+        if state.ndim != 2 or action.shape != state.shape or state.shape[-1] != width:
+            raise ValueError(f'{path} {state_key}/{action_key} must have shape (T,{width})')
+        length=state.shape[0]
+        steps=np.arange(horizon)
+        source=np.minimum(np.arange(length)[:,None]+steps, length-1)
+        chunks.append(policy.pose_to_relative(state[:,None,:], action[source], action_eef=action_eef).reshape(-1, width))
+    if not chunks: raise ValueError('no episodes for relative action stats')
+    stats=_quantile_stats(np.concatenate(chunks, axis=0))
+    logging.info('Relative action norm stats from %d episodes, horizon %d, frames %d',
+                 len(episode_indices), horizon, sum(len(c) for c in chunks))
+    return stats
 
 def get_linglong_configs():
     from openpi.training import config as c
@@ -68,6 +104,10 @@ def get_linglong_configs():
         # unless state_encoding is set on the command line.
         eef: bool = False
         state_encoding: Literal['joint', 'eef'] | None = None
+        # Train on poses relative to the current state. Policy outputs convert back to absolute.
+        relative_actions: bool = False
+        # Checkpoint loading already has the saved action stats. Not a launch flag.
+        skip_relative_norm_stats: tyro.conf.Suppress[bool] = False
         def create(self, assets_dirs, model_config):
             root=Path(self.dataset_root)
             asset_id=self.assets.asset_id or 'linglong_h'
@@ -75,16 +115,27 @@ def get_linglong_configs():
                 self.assets, assets_dir=str(root/'assets'), asset_id=asset_id))
             base=aligned.create_base_config(assets_dirs,model_config)
             state_eef,action_eef=policy.resolve_encoding(self.eef, self.state_encoding)
+            if self.relative_actions and state_eef != action_eef:
+                raise ValueError('relative actions require the state and action encodings to match')
             state_key='state_eef' if state_eef else 'observation.state'
             action_key='action_eef' if action_eef else 'action'
             image_keys=[f'observation.images.{k}' for k in ('head','left','right')]
+            norm_stats=select_norm_stats(root, base.norm_stats, state_eef, action_eef)
+            if self.relative_actions and not self.skip_relative_norm_stats:
+                episodes=json.loads((root/'train_episodes.json').read_text())
+                norm_stats={**norm_stats, 'actions':relative_action_norm_stats(
+                    root, [int(i) for i in episodes], action_eef, model_config.action_horizon)}
+            inputs=[policy.LinglongInputs(state_eef=state_eef, action_eef=action_eef)]
+            outputs=[policy.LinglongOutputs(action_eef=action_eef)]
+            if self.relative_actions:
+                inputs.append(policy.LinglongRelativeActions(action_eef=action_eef))
+                outputs.insert(0, policy.LinglongAbsoluteActions(action_eef=action_eef))
             return dataclasses.replace(base,dataset_root=str(root),episode_indices_path=str(root/'train_episodes.json'),
                 prompt_from_task=True,action_sequence_keys=(action_key,),
-                norm_stats=select_norm_stats(root, base.norm_stats, state_eef, action_eef),
+                norm_stats=norm_stats,
                 repack_transforms=transforms.Group(inputs=[transforms.RepackTransform({
                     **{k:k for k in (*image_keys,'prompt')},'observation.state':state_key,'actions':action_key})]),
-                data_transforms=transforms.Group(inputs=[policy.LinglongInputs(state_eef=state_eef, action_eef=action_eef)],
-                                                 outputs=[policy.LinglongOutputs(action_eef=action_eef)]),
+                data_transforms=transforms.Group(inputs=inputs, outputs=outputs),
                 model_transforms=c.ModelTransformFactory(default_prompt=policy.PROMPT)(model_config))
 
     root=Path(__file__).resolve().parents[4]

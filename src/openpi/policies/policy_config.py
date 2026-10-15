@@ -1,3 +1,5 @@
+import dataclasses
+import json
 import logging
 import os
 import pathlib
@@ -44,6 +46,7 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    train_config = _relative_actions_from_checkpoint(train_config, checkpoint_dir)
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
@@ -91,4 +94,22 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+    )
+
+
+def _relative_actions_from_checkpoint(train_config, checkpoint_dir):
+    """A relative-action checkpoint still serves absolute poses. Eval and the robot keep their callers."""
+    path = pathlib.Path(checkpoint_dir) / "inference_config.json"
+    if not path.is_file():
+        return train_config
+    metadata = json.loads(path.read_text()).get("policy_metadata") or {}
+    if not metadata.get("relative_actions"):
+        return train_config
+    data = train_config.data
+    if not hasattr(data, "relative_actions") or data.relative_actions:
+        return train_config
+    logging.info("Checkpoint %s trained relative actions; converting policy outputs back to absolute", checkpoint_dir)
+    return dataclasses.replace(
+        train_config,
+        data=dataclasses.replace(data, relative_actions=True, skip_relative_norm_stats=True),
     )
